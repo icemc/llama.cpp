@@ -99,6 +99,34 @@ GGML_API size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTR
 GGML_API size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// =============================================================
+// BLAQ: Bandwidth- and Layout-Aware Quantization
+// =============================================================
+
+// --- BLAQ_Q4_128 (128-weight block, 64-byte cache-line target) ---
+GGML_API void   quantize_row_blaq_q4_128_ref(const float * GGML_RESTRICT x,
+                                              block_blaq_q4_128 * GGML_RESTRICT y,
+                                              int64_t k);
+GGML_API void   dequantize_row_blaq_q4_128  (const block_blaq_q4_128 * GGML_RESTRICT x,
+                                              float * GGML_RESTRICT y,
+                                              int64_t k);
+GGML_API size_t quantize_blaq_q4_128        (const float * GGML_RESTRICT src,
+                                              void  * GGML_RESTRICT dst,
+                                              int64_t nrows, int64_t n_per_row,
+                                              const float * imatrix);
+
+// --- BLAQ_Q4_256 (256-weight block, 128-byte cache-line target) ---
+GGML_API void   quantize_row_blaq_q4_256_ref(const float * GGML_RESTRICT x,
+                                              block_blaq_q4_256 * GGML_RESTRICT y,
+                                              int64_t k);
+GGML_API void   dequantize_row_blaq_q4_256  (const block_blaq_q4_256 * GGML_RESTRICT x,
+                                              float * GGML_RESTRICT y,
+                                              int64_t k);
+GGML_API size_t quantize_blaq_q4_256        (const float * GGML_RESTRICT src,
+                                              void  * GGML_RESTRICT dst,
+                                              int64_t nrows, int64_t n_per_row,
+                                              const float * imatrix);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

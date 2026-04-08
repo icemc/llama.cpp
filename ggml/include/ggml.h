@@ -428,7 +428,12 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_COUNT   = 41,
+
+        // BLAQ: Bandwidth- and Layout-Aware Quantization
+        GGML_TYPE_BLAQ_Q4_128 = 41, // 4-bit, 128-weight block (64-byte cache-line target)
+        GGML_TYPE_BLAQ_Q4_256 = 42, // 4-bit, 256-weight block (128-byte cache-line target)
+
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision

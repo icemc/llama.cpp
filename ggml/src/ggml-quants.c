@@ -5399,6 +5399,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
 
+        case GGML_TYPE_BLAQ_Q4_128:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_blaq_q4_128, data, nb);
+            } break;
+        case GGML_TYPE_BLAQ_Q4_256:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_blaq_q4_256, data, nb);
+            } break;
+
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5413,4 +5422,254 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+// ================================================================
+// BLAQ: Bandwidth- and Layout-Aware Quantization
+//
+// Storage format: per-32-weight sub-block two-group nibble packing,
+// matching Q4_0 convention.  For each sub-block of 32 weights:
+//   qs[base + j].lo = w[sub*32 + j]       (first 16 of sub-block)
+//   qs[base + j].hi = w[sub*32 + j + 16]  (second 16 of sub-block)
+// where base = sub * (QK8_0/2) and j = 0..QK8_0/2-1.
+// This enables correct dot-product with Q8_0 activations stored
+// sequentially (same as Q4_0 vec_dot logic applied per sub-block).
+// ================================================================
+
+// ----------------------------------------------------------------
+// Shared helpers
+// ----------------------------------------------------------------
+
+// Golden-section search: find d* = argmin_d sum_j I[j]*(w[j]-Q(w[j],d))^2
+// ~30 iterations for ~1e-6 relative tolerance.
+static float blaq_find_scale_gs(const float * w, const float * imatrix,
+                                  int n, float d_lo, float d_hi) {
+    static const float phi = 0.6180339887f;
+    float a = d_lo, b = d_hi;
+    float c = b - phi * (b - a);
+    float d = a + phi * (b - a);
+
+    for (int iter = 0; iter < 30; ++iter) {
+        float fc = 0.f, fd = 0.f;
+        for (int j = 0; j < n; ++j) {
+            const float im_j = imatrix ? imatrix[j] : 1.f;
+
+            float qc = roundf(w[j] / c);
+            qc = qc < -8.f ? -8.f : qc > 7.f ? 7.f : qc;
+            const float dc = w[j] - qc * c;
+            fc += im_j * dc * dc;
+
+            float qd = roundf(w[j] / d);
+            qd = qd < -8.f ? -8.f : qd > 7.f ? 7.f : qd;
+            const float dd = w[j] - qd * d;
+            fd += im_j * dd * dd;
+        }
+        if (fc < fd) { b = d; } else { a = c; }
+        c = b - phi * (b - a);
+        d = a + phi * (b - a);
+    }
+    return 0.5f * (a + b);
+}
+
+// Pack one block using per-sub-block two-group nibble encoding.
+// Both _ref (absmax) and _impl (imatrix-aware) call this helper.
+static void blaq_pack_block(const float * GGML_RESTRICT src,
+                              uint8_t * GGML_RESTRICT qs,
+                              int qk, float id) {
+    const int ratio = qk / QK8_0;
+    for (int s = 0; s < ratio; ++s) {
+        const float * sub = src + s * QK8_0;
+        const int base_j  = s  * (QK8_0 / 2);
+        for (int j = 0; j < QK8_0 / 2; ++j) {
+            int q0 = (int)roundf(sub[j]            * id) + 8;
+            int q1 = (int)roundf(sub[j + QK8_0/2]  * id) + 8;
+            q0 = q0 < 0 ? 0 : q0 > 15 ? 15 : q0;
+            q1 = q1 < 0 ? 0 : q1 > 15 ? 15 : q1;
+            qs[base_j + j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+// ================================================================
+// BLAQ_Q4_128
+// ================================================================
+
+void quantize_row_blaq_q4_128_ref(const float * GGML_RESTRICT x,
+                                    block_blaq_q4_128 * GGML_RESTRICT y,
+                                    int64_t k) {
+    assert(k % QK_BLAQ_128 == 0);
+    const int64_t nb = k / QK_BLAQ_128;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x + i * QK_BLAQ_128;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_128; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        const float d = amax / 7.f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_128 / 2); continue; }
+
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, 1.f / d);
+    }
+}
+
+void dequantize_row_blaq_q4_128(const block_blaq_q4_128 * GGML_RESTRICT x,
+                                   float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BLAQ_128 == 0);
+    const int64_t nb = k / QK_BLAQ_128;
+    const int ratio = QK_BLAQ_128 / QK8_0;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * out = y + i * QK_BLAQ_128;
+
+        for (int s = 0; s < ratio; ++s) {
+            float * sub_out = out + s * QK8_0;
+            const int base_j = s * (QK8_0 / 2);
+            for (int j = 0; j < QK8_0 / 2; ++j) {
+                sub_out[j]            = ((x[i].qs[base_j + j] & 0x0F) - 8) * d;
+                sub_out[j + QK8_0/2] = ((x[i].qs[base_j + j] >>   4) - 8) * d;
+            }
+        }
+    }
+}
+
+static void quantize_row_blaq_q4_128_impl(const float * GGML_RESTRICT x,
+                                            block_blaq_q4_128 * GGML_RESTRICT y,
+                                            int64_t n, const float * imatrix) {
+    assert(n % QK_BLAQ_128 == 0);
+    const int64_t nb = n / QK_BLAQ_128;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x   + i * QK_BLAQ_128;
+        const float * im  = imatrix ? imatrix + i * QK_BLAQ_128 : NULL;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_128; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        if (amax == 0.f) {
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].qs, 0x88, QK_BLAQ_128 / 2);
+            continue;
+        }
+
+        float d;
+        if (im) {
+            d = blaq_find_scale_gs(src, im, QK_BLAQ_128, amax / 15.f, amax / 7.f);
+        } else {
+            d = amax / 7.f;
+        }
+        y[i].d = GGML_FP32_TO_FP16(d);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, (d > 0.f) ? 1.f / d : 0.f);
+    }
+}
+
+size_t quantize_blaq_q4_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                               int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    assert(n_per_row % QK_BLAQ_128 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_BLAQ_Q4_128, n_per_row);
+    if (!imatrix) {
+        quantize_row_blaq_q4_128_ref(src, (block_blaq_q4_128 *)dst,
+                                       (int64_t)nrows * n_per_row);
+        return nrows * row_size;
+    }
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_blaq_q4_128_impl(src, (block_blaq_q4_128 *)out,
+                                       n_per_row, imatrix);
+        src += n_per_row;
+        out += row_size;
+    }
+    return nrows * row_size;
+}
+
+// ================================================================
+// BLAQ_Q4_256
+// ================================================================
+
+void quantize_row_blaq_q4_256_ref(const float * GGML_RESTRICT x,
+                                    block_blaq_q4_256 * GGML_RESTRICT y,
+                                    int64_t k) {
+    assert(k % QK_BLAQ_256 == 0);
+    const int64_t nb = k / QK_BLAQ_256;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x + i * QK_BLAQ_256;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_256; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        const float d = amax / 7.f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_256 / 2); continue; }
+
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, 1.f / d);
+    }
+}
+
+void dequantize_row_blaq_q4_256(const block_blaq_q4_256 * GGML_RESTRICT x,
+                                   float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BLAQ_256 == 0);
+    const int64_t nb = k / QK_BLAQ_256;
+    const int ratio = QK_BLAQ_256 / QK8_0;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * out = y + i * QK_BLAQ_256;
+
+        for (int s = 0; s < ratio; ++s) {
+            float * sub_out = out + s * QK8_0;
+            const int base_j = s * (QK8_0 / 2);
+            for (int j = 0; j < QK8_0 / 2; ++j) {
+                sub_out[j]            = ((x[i].qs[base_j + j] & 0x0F) - 8) * d;
+                sub_out[j + QK8_0/2] = ((x[i].qs[base_j + j] >>   4) - 8) * d;
+            }
+        }
+    }
+}
+
+static void quantize_row_blaq_q4_256_impl(const float * GGML_RESTRICT x,
+                                            block_blaq_q4_256 * GGML_RESTRICT y,
+                                            int64_t n, const float * imatrix) {
+    assert(n % QK_BLAQ_256 == 0);
+    const int64_t nb = n / QK_BLAQ_256;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x   + i * QK_BLAQ_256;
+        const float * im  = imatrix ? imatrix + i * QK_BLAQ_256 : NULL;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_256; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        if (amax == 0.f) {
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].qs, 0x88, QK_BLAQ_256 / 2);
+            continue;
+        }
+
+        float d;
+        if (im) {
+            d = blaq_find_scale_gs(src, im, QK_BLAQ_256, amax / 15.f, amax / 7.f);
+        } else {
+            d = amax / 7.f;
+        }
+        y[i].d = GGML_FP32_TO_FP16(d);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, (d > 0.f) ? 1.f / d : 0.f);
+    }
+}
+
+size_t quantize_blaq_q4_256(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                               int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    assert(n_per_row % QK_BLAQ_256 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_BLAQ_Q4_256, n_per_row);
+    if (!imatrix) {
+        quantize_row_blaq_q4_256_ref(src, (block_blaq_q4_256 *)dst,
+                                       (int64_t)nrows * n_per_row);
+        return nrows * row_size;
+    }
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_blaq_q4_256_impl(src, (block_blaq_q4_256 *)out,
+                                       n_per_row, imatrix);
+        src += n_per_row;
+        out += row_size;
+    }
+    return nrows * row_size;
 }

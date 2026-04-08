@@ -267,6 +267,30 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// BLAQ: Bandwidth- and Layout-Aware Quantization
+//
+
+// 4-bit, 128-weight block -- one 64-byte cache line of weight data
+// Target: 64-byte cache-line devices (ARM Neoverse V3, x86-64)
+#define QK_BLAQ_128 128
+typedef struct {
+    ggml_half d;                        // fp16 scale factor:  2 bytes
+    uint8_t   qs[QK_BLAQ_128 / 2];     // 4-bit nibbles:     64 bytes
+} block_blaq_q4_128;                   // total:              66 bytes
+static_assert(sizeof(block_blaq_q4_128) == sizeof(ggml_half) + QK_BLAQ_128 / 2,
+              "wrong block_blaq_q4_128 size/padding");
+
+// 4-bit, 256-weight block -- one 128-byte cache line of weight data
+// Target: 128-byte cache-line devices (Apple Avalon / M-series)
+#define QK_BLAQ_256 256
+typedef struct {
+    ggml_half d;                        // fp16 scale factor:   2 bytes
+    uint8_t   qs[QK_BLAQ_256 / 2];     // 4-bit nibbles:     128 bytes
+} block_blaq_q4_256;                   // total:              130 bytes
+static_assert(sizeof(block_blaq_q4_256) == sizeof(ggml_half) + QK_BLAQ_256 / 2,
+              "wrong block_blaq_q4_256 size/padding");
+
+//
 // Super-block quantization structures
 //
 
