@@ -152,6 +152,43 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
     }
 }
 
+// BLAQ_Q4_128: 128-weight block, one 64-byte cache line of weights.
+// The dequantize_t4 function decodes 4 weights at a time.
+// il: 0..31  →  il/16 selects low(0) or high(1) nibble half,
+//              il%16 selects which pair of uint16 to read.
+template <typename type4>
+void dequantize_blaq_q4_128_t4(device const block_blaq_q4_128 * xb, short il, thread type4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
+    const float d1 = (il/16) ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * xb->d;
+    const ushort mask0 = (il/16) ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    for (int i = 0; i < 2; i++) {
+        reg[2*i + 0] = d1 * (qs[2*(il%16) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il%16) + i] & mask1) + md;
+    }
+}
+
+// BLAQ_Q4_256: 256-weight block, one 128-byte cache line of weights.
+// il: 0..63  →  il/32 selects low(0) or high(1) nibble half,
+//              il%32 selects which pair of uint16 to read.
+template <typename type4>
+void dequantize_blaq_q4_256_t4(device const block_blaq_q4_256 * xb, short il, thread type4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
+    const float d1 = (il/32) ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * xb->d;
+    const ushort mask0 = (il/32) ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    for (int i = 0; i < 2; i++) {
+        reg[2*i + 0] = d1 * (qs[2*(il%32) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il%32) + i] & mask1) + md;
+    }
+}
+
 void quantize_q4_0(device const float * src, device block_q4_0 & dst) {
 #pragma METAL fp math_mode(safe)
     float amax = 0.0f; // absolute max
@@ -3472,6 +3509,189 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// =============================================================================
+// BLAQ: Bandwidth- and Layout-Aware Quantization — Metal kernels
+//
+// BLAQ_Q4_128: 128-weight blocks (64-byte cache-line target, Neoverse V3)
+// BLAQ_Q4_256: 256-weight blocks (128-byte cache-line target, Apple Avalon)
+//
+// Each block is { fp16 scale, uint8 qs[QK/2] }. The nibble layout is identical
+// to Q4_0 (lo nibble first), so dequantize = ((nibble & 0xF) - 8) * scale.
+//
+// Kernel design: 4 blocks per SIMD-group iteration; 8 threads per block
+// (for 128-weight blocks, each thread handles 16 weights = 8 uint8 bytes).
+// =============================================================================
+
+// BLAQ_Q4_128 mat-vec implementation
+template<short NR0, typename args_t>
+void kernel_mul_mv_blaq_q4_128_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH; // 32 threads per SIMD group
+    constexpr short NQ  = 4;           // blocks processed per SIMD-group iteration
+    // NW/NQ = 8 threads per block; each thread handles 128/8 = 16 weights
+
+    const int nb = args.ne00 / QK_BLAQ_128;
+
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_blaq_q4_128 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_blaq_q4_128 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    // ix: block index within SIMD group (0..NQ-1)
+    // il: lane within block (0..NW/NQ-1 = 0..7)
+    //     → handles weights [il*16 .. il*16+15] within the 128-weight block
+    const short ix = tiisg / (NW/NQ);
+    const short il = tiisg % (NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[16];
+    device const float * yb = y + ib0*QK_BLAQ_128 + il*16;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short i = 0; i < 16; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const uint8_t * qs = ax[row][ib].qs + il*8;
+            const float d = ax[row][ib].d;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                const float w0 = (float)((int)(qs[i] & 0x0F) - 8);
+                const float w1 = (float)((int)(qs[i] >>  4) - 8);
+                sumq += w0*yl[2*i] + w1*yl[2*i+1];
+            }
+            sumf[row] += sumq * d;
+        }
+
+        yb += NSG*NQ*QK_BLAQ_128;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_blaq_q4_128_f32")]]
+kernel void kernel_mul_mv_blaq_q4_128_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_blaq_q4_128_f32_impl<N_R0_BLAQ_Q4_128, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// BLAQ_Q4_256 mat-vec implementation
+// 2 blocks per SIMD-group iteration; 16 threads per block;
+// each thread handles 256/16 = 16 weights = 8 uint8 bytes.
+template<short NR0, typename args_t>
+void kernel_mul_mv_blaq_q4_256_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NQ  = 2;           // blocks per SIMD-group iteration (16 threads each)
+
+    const int nb = args.ne00 / QK_BLAQ_256;
+
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_blaq_q4_256 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_blaq_q4_256 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg / (NW/NQ);  // 0..NQ-1
+    const short il = tiisg % (NW/NQ);  // 0..(NW/NQ-1) = 0..15
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[16];
+    device const float * yb = y + ib0*QK_BLAQ_256 + il*16;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short i = 0; i < 16; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const uint8_t * qs = ax[row][ib].qs + il*8;
+            const float d = ax[row][ib].d;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                const float w0 = (float)((int)(qs[i] & 0x0F) - 8);
+                const float w1 = (float)((int)(qs[i] >>  4) - 8);
+                sumq += w0*yl[2*i] + w1*yl[2*i+1];
+            }
+            sumf[row] += sumq * d;
+        }
+
+        yb += NSG*NQ*QK_BLAQ_256;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_blaq_q4_256_f32")]]
+kernel void kernel_mul_mv_blaq_q4_256_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_blaq_q4_256_f32_impl<N_R0_BLAQ_Q4_256, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
@@ -3758,6 +3978,18 @@ template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_2")]]  kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_mxfp4,  32, dequantize_mxfp4_t4>;
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_mxfp4,  32, dequantize_mxfp4_t4>;
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_mxfp4,  32, dequantize_mxfp4_t4>;
+
+// BLAQ_Q4_128: chpb = 128/4 = 32 chunks per block
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
+
+// BLAQ_Q4_256: chpb = 256/4 = 64 chunks per block
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
 
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
@@ -10076,6 +10308,9 @@ template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>>>;
 
 template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
+
+template [[host_name("kernel_mul_mv_id_blaq_q4_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_q4_128_f32_impl<N_R0_BLAQ_Q4_128>>>;
+template [[host_name("kernel_mul_mv_id_blaq_q4_256_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_q4_256_f32_impl<N_R0_BLAQ_Q4_256>>>;
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
