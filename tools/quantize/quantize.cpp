@@ -43,8 +43,10 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "IQ2_M",    LLAMA_FTYPE_MOSTLY_IQ2_M,    " 2.7  bpw quantization",            },
     { "IQ1_S",    LLAMA_FTYPE_MOSTLY_IQ1_S,    " 1.56 bpw quantization",            },
     { "IQ1_M",    LLAMA_FTYPE_MOSTLY_IQ1_M,    " 1.75 bpw quantization",            },
-    { "TQ1_0",    LLAMA_FTYPE_MOSTLY_TQ1_0,    " 1.69 bpw ternarization",           },
-    { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
+    { "TQ1_0",       LLAMA_FTYPE_MOSTLY_TQ1_0,       " 1.69 bpw ternarization",           },
+    { "TQ2_0",       LLAMA_FTYPE_MOSTLY_TQ2_0,       " 2.06 bpw ternarization",           },
+    { "BLAQ_Q4_128", LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128, " 4.52 bpw BLAQ (128-weight blocks, hardware-aware)",  },
+    { "BLAQ_Q4_256", LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256, " 4.51 bpw BLAQ (256-weight blocks, hardware-aware)",  },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.96G, +3.1836 ppl @ Llama-3-8B",  },
     { "IQ3_XXS",  LLAMA_FTYPE_MOSTLY_IQ3_XXS,  " 3.06 bpw quantization",            },
@@ -164,7 +166,11 @@ static void usage(const char * executable) {
     printf("                                      WARNING: this is an advanced option, use with care.\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
-    printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
+    printf("  --blaq-profile file_name\n");
+    printf("                                      path to BLAQ hardware profile JSON (from llama-blaq-profile)\n");
+    printf("                                      used only when quantizing with BLAQ_Q4_128 or BLAQ_Q4_256\n");
+    printf("                                      if omitted, built-in defaults (100 GB/s, sigma=0.20) are used\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -500,6 +506,7 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string blaq_profile_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -568,6 +575,13 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--blaq-profile") == 0) {
+            if (arg_idx < argc-1) {
+                blaq_profile_file = argv[++arg_idx];
+                params.blaq_profile_path = blaq_profile_file.c_str();
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }

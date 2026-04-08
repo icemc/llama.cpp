@@ -155,6 +155,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
 
+        // BLAQ: Bandwidth- and Layout-Aware Quantization
+        LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128   = 40, // 4-bit, 128-weight blocks (64-byte cache-line target)
+        LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256   = 41, // 4-bit, 256-weight blocks (128-byte cache-line target)
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 
@@ -396,6 +400,7 @@ extern "C" {
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types
         void * prune_layers;                  // pointer to vector containing layer indices to prune
+        const char * blaq_profile_path;       // path to BLAQ hardware profile JSON (NULL = use defaults)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

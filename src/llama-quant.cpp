@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
+#include "blaq-profile.h"
 
 #include <cmath>
 #include <cstring>
@@ -184,6 +185,9 @@ struct quantize_state_impl {
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
 
+    // BLAQ hardware profile (loaded once, used per-tensor for type selection)
+    blaq_profile_t blaq_prof = {};
+
     quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
         model(model), params(params)
     {
@@ -192,6 +196,24 @@ struct quantize_state_impl {
             const auto & tensor_types = *static_cast<const std::vector<tensor_type_option> *>(params->tensor_types);
             for (const auto & [tname, qtype] : tensor_types) {
                 tensor_type_patterns.emplace_back(std::regex(tname), qtype);
+            }
+        }
+
+        // Load BLAQ hardware profile
+        const llama_ftype ft = params->ftype;
+        if (ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) {
+            if (params->blaq_profile_path &&
+                    blaq_profile_load_json(&blaq_prof, params->blaq_profile_path)) {
+                LLAMA_LOG_INFO("%s: loaded BLAQ profile from %s "
+                               "(cache_line=%u B, peak_bw=%.1f GB/s, sigma=%.3f)\n",
+                               __func__, params->blaq_profile_path,
+                               blaq_prof.cache_line_bytes,
+                               blaq_prof.peak_bw_bytes_per_sec / 1e9,
+                               blaq_prof.contention_ratio);
+            } else {
+                blaq_profile_defaults(&blaq_prof);
+                LLAMA_LOG_INFO("%s: no BLAQ profile provided — using defaults "
+                               "(cache_line=64 B, peak_bw=100 GB/s)\n", __func__);
             }
         }
     }
@@ -204,6 +226,8 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    // BLAQ: refined type set after f32 data is available in the main loop
+    ggml_type       blaq_refined_type = GGML_TYPE_COUNT; // GGML_TYPE_COUNT = "not set"
 };
 
 //
@@ -384,7 +408,10 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
-            case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_TQ2_0:        return_type = GGML_TYPE_Q4_0;   break;
+            // BLAQ: fallback to Q4_K (256-weight block), which covers the same dimensions
+            case GGML_TYPE_BLAQ_Q4_128:
+            case GGML_TYPE_BLAQ_Q4_256:  return_type = GGML_TYPE_Q4_K;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -406,6 +433,74 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
         LLAMA_LOG_WARN("-> falling back to %7s\n", ggml_type_name(return_type));
     }
     return return_type;
+}
+
+// ============================================================
+// BLAQ: per-tensor type selector (Algorithm 2, Phase 1)
+//
+// Given a hardware profile, evaluates the BLAQ cost function for both
+// candidate block sizes and returns the type with the lower total cost.
+// If only one block size fits the tensor dimension, that one is returned.
+// ============================================================
+static ggml_type blaq_select_type(
+        const float          * f32_row,   // first row of the tensor (representative proxy)
+        const float          * imatrix,   // per-column importance (may be nullptr)
+        int64_t                n_per_row,
+        const blaq_profile_t * prof) {
+
+    const ggml_type C128 = GGML_TYPE_BLAQ_Q4_128;
+    const ggml_type C256 = GGML_TYPE_BLAQ_Q4_256;
+
+    // Query block dimensions via public GGML API (avoids dependency on ggml-common.h)
+    const int64_t blk128 = (int64_t)ggml_blck_size(C128);  // 128
+    const int64_t blk256 = (int64_t)ggml_blck_size(C256);  // 256
+    const size_t  bsz128 = ggml_type_size(C128);           // sizeof(block_blaq_q4_128) = 66
+    const size_t  bsz256 = ggml_type_size(C256);           // sizeof(block_blaq_q4_256) = 130
+
+    // Dimension compatibility: both block sizes must evenly divide n_per_row
+    const bool fits128 = (blk128 > 0 && n_per_row % blk128 == 0);
+    const bool fits256 = (blk256 > 0 && n_per_row % blk256 == 0);
+
+    if (!fits128 && !fits256) return C128; // both incompatible — tensor_type_fallback handles this
+    if (!fits256)             return C128;
+    if (!fits128)             return C256;
+
+    // Both fit — evaluate BLAQ cost on the first row as a proxy
+    auto erec = [&](int64_t s) -> float {
+        float err = 0.f;
+        for (int64_t g = 0; g < n_per_row / s; ++g) {
+            float amax = 0.f;
+            for (int64_t j = g * s; j < (g + 1) * s; ++j) {
+                amax = fmaxf(amax, fabsf(f32_row[j]));
+            }
+            const float d = amax / 7.f;
+            if (d == 0.f) continue;
+            const float id = 1.f / d;
+            for (int64_t j = g * s; j < (g + 1) * s; ++j) {
+                float q = roundf(f32_row[j] * id);
+                q = fmaxf(-8.f, fminf(7.f, q));
+                const float diff = f32_row[j] - q * d;
+                const float w    = imatrix ? imatrix[j] : 1.f;
+                err += w * diff * diff;
+            }
+        }
+        return err;
+    };
+
+    const float erec128 = erec(blk128);
+    const float erec256 = erec(blk256);
+
+    // Bandwidth cost: blocks * bytes_per_block / peak_bandwidth
+    const float cbw128 = (float)(n_per_row / blk128) * (float)bsz128
+                          / (float)prof->peak_bw_bytes_per_sec;
+    const float cbw256 = (float)(n_per_row / blk256) * (float)bsz256
+                          / (float)prof->peak_bw_bytes_per_sec;
+
+    // C_mem = 0 for both: alignment is guaranteed by construction
+    const float cost128 = erec128 + prof->lambda_bw * cbw128;
+    const float cost256 = erec256 + prof->lambda_bw * cbw256;
+
+    return (cost128 <= cost256) ? C128 : C256;
 }
 
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
@@ -815,8 +910,10 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_K_S:
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
-        case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
-        case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
+        case LLAMA_FTYPE_MOSTLY_TQ1_0:        return GGML_TYPE_TQ1_0;
+        case LLAMA_FTYPE_MOSTLY_TQ2_0:        return GGML_TYPE_TQ2_0;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128:  return GGML_TYPE_BLAQ_Q4_128;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256:  return GGML_TYPE_BLAQ_Q4_256;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -1131,6 +1228,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         const ggml_type cur_type = tensor->type;
         const ggml_type new_type = tm.target_type;
+        // effective_type may be refined by BLAQ cost-based selection
+        ggml_type effective_type = new_type;
 
         // If we've decided to quantize to the same type the tensor is already
         // in then there's nothing to do.
@@ -1197,6 +1296,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
                 }
 
+                const int64_t n_per_row = tensor->ne[0];
+                const int64_t nrows     = tensor->ne[1];
+
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_F32) {
@@ -1208,16 +1310,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     f32_data = (float *) f32_conv_buf.data();
                 }
 
-                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                // BLAQ: if this is a BLAQ ftype, run the cost-based type selector now
+                // that we have access to the fp32 data. Override new_type in-place.
+                if ((ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 ||
+                     ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) &&
+                    new_type == tm.target_type &&          // not already overridden by --tensor-type
+                    (new_type == GGML_TYPE_BLAQ_Q4_128 || new_type == GGML_TYPE_BLAQ_Q4_256)) {
+
+                    const ggml_type selected = blaq_select_type(
+                        f32_data, imatrix, n_per_row, &qs.blaq_prof);
+                    if (selected != new_type) {
+                        LLAMA_LOG_INFO("[BLAQ] %s: %s -> %s (cost-based selection)\n",
+                                       name.c_str(),
+                                       ggml_type_name(new_type),
+                                       ggml_type_name(selected));
+                        const_cast<tensor_metadata &>(tm).blaq_refined_type = selected;
+                    }
+                }
+                effective_type =
+                    (tm.blaq_refined_type != GGML_TYPE_COUNT) ? tm.blaq_refined_type : new_type;
+
+                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(effective_type));
                 fflush(stdout);
 
                 if (work.size() < (size_t)nelements * 4) {
                     work.resize(nelements * 4); // upper bound on size
                 }
                 new_data = work.data();
-
-                const int64_t n_per_row = tensor->ne[0];
-                const int64_t nrows = tensor->ne[1];
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
@@ -1230,10 +1349,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                     const float * f32_data_03 = f32_data + i03 * nelements_matrix;
-                    void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
+                    void * new_data_03 = (char *)new_data + ggml_row_size(effective_type, n_per_row) * i03 * nrows;
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                    new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    new_size += llama_tensor_quantize_impl(effective_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
@@ -1241,7 +1360,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             total_size_new += new_size;
 
             // update the gguf meta data as we go
-            gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), new_type);
+            gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), effective_type);
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), name.c_str())) == new_size);
             gguf_set_tensor_data(ctx_outs[cur_split].get(), name.c_str(), new_data);
 
@@ -1289,7 +1408,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.blaq_profile_path           =*/ nullptr,
     };
 
     return result;
