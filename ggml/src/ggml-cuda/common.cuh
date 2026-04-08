@@ -955,6 +955,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_BLAQ_Q4_128> {
+    static constexpr int qk = QK_BLAQ_128;
+    static constexpr int qr = QR_BLAQ_128;
+    static constexpr int qi = QI_BLAQ_128;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_BLAQ_Q4_256> {
+    static constexpr int qk = QK_BLAQ_256;
+    static constexpr int qr = QR_BLAQ_256;
+    static constexpr int qi = QI_BLAQ_256;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR2_K;

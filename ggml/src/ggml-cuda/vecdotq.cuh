@@ -669,6 +669,83 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
+// BLAQ: Bandwidth- and Layout-Aware Quantization vec dot kernels (MMVQ)
+//
+// BLAQ uses adjacent nibble interleaving: qs[b] lo nibble = weight 2b, hi nibble = weight 2b+1.
+// This is the opposite of Q4_0's split layout (lo = weight b, hi = weight b+QK/2).
+// Matching the Q8_1 activations to BLAQ nibble positions requires byte-level deinterleaving.
+
+#define VDR_BLAQ_Q4_128_Q8_1_MMVQ 4
+#define VDR_BLAQ_Q4_128_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_blaq_q4_128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_q4_128 * bq = (const block_blaq_q4_128 *) vbq + kbx;
+    // iqs/VDR selects which Q8_1 block (0-3) within this BLAQ block's 4-block span
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_Q4_128_Q8_1_MMVQ);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_Q4_128_Q8_1_MMVQ; ++i) {
+        // One BLAQ int32 = 4 bytes = 8 adjacent weights (even at lo nibbles, odd at hi nibbles)
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;          // even-indexed weights: w_{8i}, w_{8i+2}, w_{8i+4}, w_{8i+6}
+        const int hi = (v >> 4) & 0x0F0F0F0F;   // odd-indexed weights:  w_{8i+1}, w_{8i+3}, w_{8i+5}, w_{8i+7}
+
+        // Q8_1 activations for these 8 weights: two consecutive int32s covering a_{8i}..a_{8i+7}
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0); // a_{8i+0}, a_{8i+1}, a_{8i+2}, a_{8i+3}
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1); // a_{8i+4}, a_{8i+5}, a_{8i+6}, a_{8i+7}
+
+        // Deinterleave: gather even-position activations to match lo nibbles
+        const int u_even = (u0 & 0xFF)              | (((u0 >> 16) & 0xFF) <<  8) |
+                           ((u1 & 0xFF) << 16)       | (((u1 >> 16) & 0xFF) << 24);
+        // Gather odd-position activations to match hi nibbles
+        const int u_odd  = ((u0 >>  8) & 0xFF)      | (((u0 >> 24) & 0xFF) <<  8) |
+                           (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
+
+        sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+    }
+
+    // Correction: each weight nibble has an implicit -8 offset; the partial sum bq8->ds.y = d*sum(a_i)
+    // covers all 32 activations in the Q8_1 block matched by this thread (VDR=4 → one full Q8_1 block).
+    const float2 ds8f = __half22float2(bq8->ds);
+    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+}
+
+#define VDR_BLAQ_Q4_256_Q8_1_MMVQ 4
+#define VDR_BLAQ_Q4_256_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_blaq_q4_256_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_q4_256 * bq = (const block_blaq_q4_256 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_Q4_256_Q8_1_MMVQ);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_Q4_256_Q8_1_MMVQ; ++i) {
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;
+        const int hi = (v >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+
+        const int u_even = (u0 & 0xFF)               | (((u0 >> 16) & 0xFF) <<  8) |
+                           ((u1 & 0xFF) << 16)        | (((u1 >> 16) & 0xFF) << 24);
+        const int u_odd  = ((u0 >>  8) & 0xFF)       | (((u0 >> 24) & 0xFF) <<  8) |
+                           (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
+
+        sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+    }
+
+    const float2 ds8f = __half22float2(bq8->ds);
+    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

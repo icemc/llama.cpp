@@ -162,6 +162,12 @@ typedef sycl::half2 ggml_half2;
 #define QI3_S (QK_K / (4*QR3_S))
 #define QR3_S 4
 
+#define QI_BLAQ_128 (QK_BLAQ_128 / (4 * QR_BLAQ_128))  // 128/8 = 16
+#define QR_BLAQ_128 2
+
+#define QI_BLAQ_256 (QK_BLAQ_256 / (4 * QR_BLAQ_256))  // 256/8 = 32
+#define QR_BLAQ_256 2
+
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
