@@ -2575,6 +2575,28 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+
+    // BLAQ-Sched: read optional bandwidth-pressure metadata written by llama-quantize
+    {
+        const int64_t key_count = gguf_find_key(ctx, "blaq.layer_count");
+        if (key_count >= 0) {
+            const uint32_t n_blaq_layers = gguf_get_val_u32(ctx, key_count);
+
+            float peak_bw = 0.f, sigma = 0.f;
+            const int64_t key_bw    = gguf_find_key(ctx, "blaq.peak_bandwidth_gbs");
+            const int64_t key_sigma = gguf_find_key(ctx, "blaq.contention_ratio");
+            if (key_bw    >= 0) peak_bw = gguf_get_val_f32(ctx, key_bw);
+            if (key_sigma >= 0) sigma   = gguf_get_val_f32(ctx, key_sigma);
+
+            LLAMA_LOG_INFO("%s: BLAQ-Sched profile found: %u layers, "
+                           "peak_bw=%.1f GB/s, sigma=%.3f\n",
+                           __func__, n_blaq_layers, (double)peak_bw, (double)sigma);
+
+            // Phase 5+: use bw_pressure array to rank layers for GPU offloading.
+            // For now, the presence of these keys is logged and future scheduling
+            // logic can read them via gguf_find_key / gguf_get_arr_data.
+        }
+    }
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {

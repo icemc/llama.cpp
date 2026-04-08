@@ -9,6 +9,7 @@
 #include <string>
 #include <cinttypes>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <regex>
 #include <thread>
@@ -433,6 +434,31 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
         LLAMA_LOG_WARN("-> falling back to %7s\n", ggml_type_name(return_type));
     }
     return return_type;
+}
+
+// ============================================================
+// BLAQ-Sched helpers
+// ============================================================
+
+// Parse layer index from a tensor name of the form "blk.N.*"
+// Returns -1 if the name does not match the expected pattern.
+static int blaq_parse_layer_idx(const std::string & name) {
+    const auto pos = name.find("blk.");
+    if (pos == std::string::npos) return -1;
+    const size_t start = pos + 4;
+    size_t end = start;
+    while (end < name.size() && std::isdigit((unsigned char)name[end])) ++end;
+    if (end == start || (end < name.size() && name[end] != '.')) return -1;
+    return std::stoi(name.substr(start, end - start));
+}
+
+// Compute mean importance weight for a row (column importance vector).
+// Returns 1.0 when imatrix is null (uniform weighting).
+static float blaq_mean_imatrix(const float * imatrix, int64_t n) {
+    if (!imatrix || n <= 0) return 1.f;
+    float sum = 0.f;
+    for (int64_t i = 0; i < n; ++i) sum += imatrix[i];
+    return sum / (float)n;
 }
 
 // ============================================================
@@ -1152,6 +1178,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     size_t total_size_org = 0;
     size_t total_size_new = 0;
 
+    // BLAQ-Sched: per-layer bandwidth pressure accumulator (layer_idx → Cbw sum)
+    std::map<int, float> blaq_layer_cbw;
+
     std::vector<std::thread> workers;
     workers.reserve(nthread);
 
@@ -1355,6 +1384,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     new_size += llama_tensor_quantize_impl(effective_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
+
+                // BLAQ-Sched: accumulate per-layer bandwidth cost for metadata
+                if ((effective_type == GGML_TYPE_BLAQ_Q4_128 ||
+                     effective_type == GGML_TYPE_BLAQ_Q4_256) &&
+                    qs.blaq_prof.peak_bw_bytes_per_sec > 0.0) {
+                    const int64_t blck_sz = (int64_t)ggml_blck_size(effective_type);
+                    const size_t  type_sz = ggml_type_size(effective_type);
+                    if (blck_sz > 0 && n_per_row % blck_sz == 0) {
+                        const int64_t n_groups  = n_per_row / blck_sz;
+                        const float   mean_im   = blaq_mean_imatrix(imatrix, n_per_row);
+                        const float   cbw       = mean_im * (float)(n_groups * (int64_t)type_sz)
+                                                  / (float)qs.blaq_prof.peak_bw_bytes_per_sec;
+                        const int     layer_idx = blaq_parse_layer_idx(name);
+                        if (layer_idx >= 0) {
+                            blaq_layer_cbw[layer_idx] += cbw;
+                        }
+                    }
+                }
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
@@ -1369,6 +1416,39 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             zeros(fout, GGML_PAD(new_size, align) - new_size);
         } // no --dry-run
     } // main loop
+
+    // BLAQ-Sched: write per-layer bandwidth pressure metadata into the first output context.
+    // For single-file quantization (the common case), ctx_outs[0] is still open here.
+    // In keep_split mode, only the first shard gets these keys — a known limitation.
+    if (!params->dry_run &&
+        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) &&
+        !blaq_layer_cbw.empty()) {
+
+        float cbw_max = 1e-30f;
+        for (const auto & kv : blaq_layer_cbw) cbw_max = std::max(cbw_max, kv.second);
+
+        std::vector<float> bw_pressure;
+        bw_pressure.reserve(blaq_layer_cbw.size());
+        for (const auto & kv : blaq_layer_cbw) {
+            bw_pressure.push_back(kv.second / cbw_max);
+        }
+
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.cache_line_bytes",
+                         qs.blaq_prof.cache_line_bytes);
+        gguf_set_val_f32(ctx_outs[0].get(), "blaq.peak_bandwidth_gbs",
+                         (float)(qs.blaq_prof.peak_bw_bytes_per_sec / 1e9));
+        gguf_set_val_f32(ctx_outs[0].get(), "blaq.contention_ratio",
+                         qs.blaq_prof.contention_ratio);
+        gguf_set_val_str(ctx_outs[0].get(), "blaq.swizzle", "none");
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.layer_count",
+                         (uint32_t)bw_pressure.size());
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.bw_pressure",
+                          GGUF_TYPE_FLOAT32,
+                          bw_pressure.data(), bw_pressure.size());
+
+        LLAMA_LOG_INFO("%s: BLAQ-Sched: wrote bandwidth pressure for %zu layers\n",
+                       __func__, blaq_layer_cbw.size());
+    }
 
     if (!params->dry_run) {
         close_ofstream();
