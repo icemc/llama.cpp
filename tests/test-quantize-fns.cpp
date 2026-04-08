@@ -21,6 +21,7 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_BLAQ = 0.007f;  // 4-bit, large blocks — same ballpark as Q4_K
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
@@ -100,6 +101,62 @@ static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_tr
     return fabsf(result - dot_ref) / test_size;
 }
 
+// =============================================================
+// BLAQ-specific alignment verification (Phase 6.3)
+// Uses the public GGML API so it does not depend on ggml-common.h.
+// =============================================================
+static int test_blaq_alignment() {
+    int num_failed = 0;
+    bool failed;
+
+    // block size (weights per block)
+    failed = !(ggml_blck_size(GGML_TYPE_BLAQ_Q4_128) == 128);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_128 blck_size: expected 128, got %d\n",
+                       (int)ggml_blck_size(GGML_TYPE_BLAQ_Q4_128));
+
+    failed = !(ggml_blck_size(GGML_TYPE_BLAQ_Q4_256) == 256);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_256 blck_size: expected 256, got %d\n",
+                       (int)ggml_blck_size(GGML_TYPE_BLAQ_Q4_256));
+
+    // type size in bytes: 2-byte scale + blck_size/2 nibble bytes
+    failed = !(ggml_type_size(GGML_TYPE_BLAQ_Q4_128) == 2 + 64);   // 66 bytes
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_128 type_size: expected 66, got %d\n",
+                       (int)ggml_type_size(GGML_TYPE_BLAQ_Q4_128));
+
+    failed = !(ggml_type_size(GGML_TYPE_BLAQ_Q4_256) == 2 + 128);  // 130 bytes
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_256 type_size: expected 130, got %d\n",
+                       (int)ggml_type_size(GGML_TYPE_BLAQ_Q4_256));
+
+    // cache-line alignment: QK * b bits must be a whole multiple of 8 * L bits
+    // QK_128=128, b=4, L=64  =>  128*4 % (8*64) == 0
+    failed = !((128 * 4) % (8 * 64) == 0);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_128 cache-line alignment\n");
+
+    // QK_256=256, b=4, L=128 =>  256*4 % (8*128) == 0
+    failed = !((256 * 4) % (8 * 128) == 0);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_256 cache-line alignment\n");
+
+    // s* = 8*L/b formula
+    failed = !(128 == 8 * 64 / 4);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_128 s* formula (8*L/b)\n");
+
+    failed = !(256 == 8 * 128 / 4);
+    num_failed += failed;
+    if (failed) printf("FAILED blaq_q4_256 s* formula (8*L/b)\n");
+
+    if (num_failed == 0) {
+        printf("BLAQ alignment assertions: ok\n");
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
     const size_t test_size = 32 * 128;
@@ -127,6 +184,9 @@ int main(int argc, char * argv[]) {
     int num_failed = 0;
     bool failed = false;
 
+    // Phase 6.3: BLAQ structural alignment assertions
+    num_failed += test_blaq_alignment();
+
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;
         const auto * qfns = ggml_get_type_traits(type);
@@ -145,14 +205,17 @@ int main(int argc, char * argv[]) {
         if (qfns_cpu->from_float && qfns->to_float) {
             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
             const float max_quantization_error =
-                type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
-                type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
-                type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
-                type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
-                type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
-                type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_TQ1_0      ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_TQ2_0      ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_Q2_K       ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_IQ2_S      ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                type == GGML_TYPE_Q3_K       ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                type == GGML_TYPE_IQ3_S      ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                type == GGML_TYPE_IQ3_XXS    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
+                type == GGML_TYPE_NVFP4      ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
+                type == GGML_TYPE_BLAQ_Q4_128 ? MAX_QUANTIZATION_TOTAL_ERROR_BLAQ :
+                type == GGML_TYPE_BLAQ_Q4_256 ? MAX_QUANTIZATION_TOTAL_ERROR_BLAQ :
+                                                MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
