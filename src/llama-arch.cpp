@@ -2762,7 +2762,11 @@ std::string LLM_TN_IMPL::str() const {
 
     if (model_tensors.find(tensor) == model_tensors.end()) {
         const char * name = LLM_TENSOR_NAMES.at(tensor);
-        if (suffix != nullptr || bid != -1 || xid != -1) {
+        // Only warn when layer-indexed formatting was requested (bid/xid != -1).
+        // A non-null suffix with bid=-1 simply means the caller is building a
+        // comparison name for a global tensor that doesn't exist in this arch —
+        // the comparison will not match and no harm is done.
+        if (bid != -1 || xid != -1) {
             LLAMA_LOG_WARN("%s: cannot properly format tensor name %s with suffix=%s bid=%d xid=%d\n",
                 __func__, name, suffix, bid, xid);
         }

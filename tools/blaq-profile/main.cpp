@@ -29,22 +29,29 @@ static void print_usage(const char * prog) {
         "  --in   <path>   load and print an existing profile JSON (no benchmarking)\n"
         "  --gamma <f>     bandwidth penalty scale  (default: 1.0)\n"
         "  --beta  <f>     contention penalty scale (default: 1.0)\n"
+        "  --sigma <f>     override contention ratio in [0,1] instead of measuring\n"
+        "                  (required on GPU systems where CPU-only measurement gives sigma=0;\n"
+        "                   typical values: 0.10-0.25 for shared-bandwidth architectures)\n"
         "  --help          show this message\n"
         "\n"
         "Example (measure current machine):\n"
         "  %s --out my_machine.json\n"
         "\n"
+        "Example (Grace-Blackwell GB10 — inject known contention ratio):\n"
+        "  %s --out gb10_profile.json --sigma 0.15\n"
+        "\n"
         "Example (inspect saved profile):\n"
         "  %s --in my_machine.json\n"
         "\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
 }
 
 int main(int argc, char ** argv) {
-    const char * out_path = "blaq_hw_profile.json";
-    const char * in_path  = nullptr;
-    float gamma = 1.0f;
-    float beta  = 1.0f;
+    const char * out_path    = "blaq_hw_profile.json";
+    const char * in_path     = nullptr;
+    float gamma        = 1.0f;
+    float beta         = 1.0f;
+    float sigma_override = -1.0f;  // -1 = auto-measure
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--out") && i + 1 < argc) {
@@ -55,6 +62,12 @@ int main(int argc, char ** argv) {
             gamma = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--beta") && i + 1 < argc) {
             beta  = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--sigma") && i + 1 < argc) {
+            sigma_override = (float)atof(argv[++i]);
+            if (sigma_override < 0.f || sigma_override > 1.f) {
+                fprintf(stderr, "error: --sigma must be in [0.0, 1.0]\n");
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
             return 0;
@@ -84,9 +97,15 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Step 1/4  detecting cache-line size ...\n");
     fprintf(stderr, "Step 2/4  measuring peak bandwidth (single agent, ~0.5 s) ...\n");
     fprintf(stderr, "Step 3/4  counting shared-bus processors ...\n");
-    fprintf(stderr, "Step 4/4  measuring contention bandwidth (~0.5 s) ...\n\n");
+    if (sigma_override >= 0.f) {
+        fprintf(stderr, "Step 4/4  contention benchmark skipped"
+                " — using sigma = %.3f (user-supplied)\n\n",
+                (double)sigma_override);
+    } else {
+        fprintf(stderr, "Step 4/4  measuring contention bandwidth (~0.5 s) ...\n\n");
+    }
 
-    if (!blaq_profile_measure(&p, gamma, beta)) {
+    if (!blaq_profile_measure(&p, gamma, beta, sigma_override)) {
         fprintf(stderr, "error: profiling failed\n");
         return 1;
     }

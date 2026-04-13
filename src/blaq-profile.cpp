@@ -27,7 +27,7 @@
 #include <sstream>
 
 #if defined(__linux__)
-#  include <unistd.h>    // sysconf
+#  include <unistd.h>    // sysconf, access
 #endif
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
@@ -135,19 +135,65 @@ static double stream_benchmark(int n_threads, double duration_s) {
 // Step 3: Shared-bus processor count
 // ---------------------------------------------------------------------------
 
+// Returns whether a discrete or integrated GPU is visible on this system.
+// Used to decide whether the CPU-only contention benchmark is meaningful.
+// Public C wrapper: blaq_gpu_on_shared_bus()
+static bool gpu_present_on_shared_bus() {
+#if defined(__APPLE__)
+    // Apple Silicon always has an integrated GPU on the same UMA bus.
+    return true;
+#elif defined(__linux__)
+    // Check for a CUDA-capable GPU via /proc/driver/nvidia/version (world-readable
+    // when the NVIDIA kernel module is loaded) or DRM render nodes (existence only —
+    // we don't open them, just test presence with access(F_OK)).
+    if (access("/proc/driver/nvidia/version", F_OK) == 0) {
+        return true;  // NVIDIA driver loaded → GPU present
+    }
+    // Fallback: check for any DRM render node (covers AMD, Intel, Nouveau, etc.)
+    for (int i = 0; i < 8; ++i) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/dri/renderD%d", 128 + i);
+        if (access(path, F_OK) == 0) {
+            return true;
+        }
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
 static uint32_t count_shared_bus_processors() {
-    // Conservative baseline: 2 (CPU + integrated GPU).
-    // On UMA SoCs (GB10, Apple M-series) this is the relevant contention pair.
-    // A full implementation would query the Metal device count (Apple) or
-    // NVML (NVIDIA) to discover the actual GPU presence.
+    // On a true UMA SoC (Apple M-series, Grace-Blackwell NVLink-C2C) the
+    // relevant agents are the CPU and the GPU sharing the same memory bus.
+    // We can only measure CPU-side contention here; GPU-side contention
+    // requires a concurrently running GPU kernel (CUDA/Metal), which is
+    // beyond the scope of this CPU-only profiler.
+    //
+    // Return 2 only on Apple (where CPU-only multi-thread does reflect the
+    // shared LPDDR bus), 1 elsewhere so the benchmark is repeatable.
+    // The caller should check gpu_present_on_shared_bus() and warn.
+#if defined(__APPLE__)
     return 2;
+#else
+    return 1;  // CPU-only; GPU contention is not measurable here
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Public C wrapper (declared in blaq-profile.h)
+// ---------------------------------------------------------------------------
+
+bool blaq_gpu_on_shared_bus(void) {
+    return gpu_present_on_shared_bus();
 }
 
 // ---------------------------------------------------------------------------
 // Main profiling function (Algorithm 1)
 // ---------------------------------------------------------------------------
 
-bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta) {
+bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta,
+                          float sigma_override) {
     if (!out) return false;
 
     // Step 1
@@ -159,12 +205,30 @@ bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta) {
     // Step 3
     out->shared_bus_procs = count_shared_bus_processors();
 
-    // Step 4: contention bandwidth (all procs reading)
-    out->obs_bw_bytes_per_sec = stream_benchmark(
-        (int)out->shared_bus_procs, 0.5);
+    // Step 4: contention bandwidth (all procs reading simultaneously)
+    //
+    // On Apple Silicon, shared_bus_procs=2 stresses the LPDDR bus as both
+    // CPU and GPU would, giving a meaningful sigma.
+    //
+    // On Linux/NVIDIA, shared_bus_procs=1 so obs_bw ≈ peak_bw (same thread
+    // count).  True GPU-HBM contention cannot be measured from CPU code.
+    // If the caller passes sigma_override >= 0, skip the benchmark and derive
+    // obs_bw synthetically so that the printed table stays consistent.
+    if (sigma_override >= 0.f) {
+        // Synthetic: obs_bw that would produce exactly sigma_override
+        out->obs_bw_bytes_per_sec =
+            out->peak_bw_bytes_per_sec * (1.0 - (double)sigma_override);
+    } else {
+        out->obs_bw_bytes_per_sec = stream_benchmark(
+            (int)out->shared_bus_procs, 0.5);
+    }
 
-    // Step 5
-    if (out->peak_bw_bytes_per_sec > 0.0) {
+    // Step 5: compute or override sigma
+    if (sigma_override >= 0.f) {
+        // Caller supplied an explicit value (from published specs or
+        // a prior CUDA-assisted measurement).
+        out->contention_ratio = sigma_override;
+    } else if (out->peak_bw_bytes_per_sec > 0.0) {
         out->contention_ratio =
             (float)(1.0 - out->obs_bw_bytes_per_sec / out->peak_bw_bytes_per_sec);
     } else {
@@ -173,6 +237,19 @@ bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta) {
     // Clamp to [0, 1]
     if (out->contention_ratio < 0.f) out->contention_ratio = 0.f;
     if (out->contention_ratio > 1.f) out->contention_ratio = 1.f;
+
+    // Warn when GPU is present but we could not measure contention
+    if (gpu_present_on_shared_bus() && out->shared_bus_procs == 1
+            && sigma_override < 0.f) {
+        fprintf(stderr,
+            "WARNING: GPU detected but contention ratio (sigma) was measured\n"
+            "         using CPU threads only.  On discrete-GPU or NVLink-C2C\n"
+            "         systems (e.g. Grace-Blackwell GB10) the GPU-HBM bus is\n"
+            "         independent of CPU LPDDR, so sigma=%.3f may be inaccurate.\n"
+            "         Use --sigma <value> to supply a known contention ratio.\n"
+            "         Typical values: 0.10-0.25 for shared-BW systems.\n\n",
+            (double)out->contention_ratio);
+    }
 
     // Step 6: aligned group sizes for b=4
     // s*(b, L) = 8*L/b  =>  for b=4: 2*L
@@ -280,8 +357,16 @@ void blaq_profile_print(const blaq_profile_t * p) {
             p->peak_bw_bytes_per_sec / 1e9);
     fprintf(stderr, "  Contention BW         : %.1f GB/s\n",
             p->obs_bw_bytes_per_sec  / 1e9);
-    fprintf(stderr, "  Contention ratio (σ)  : %.3f\n",     p->contention_ratio);
-    fprintf(stderr, "  Shared-bus procs      : %u\n",        p->shared_bus_procs);
+
+    const bool gpu_present = gpu_present_on_shared_bus();
+    const bool sigma_zero  = (p->contention_ratio < 0.005f);
+    fprintf(stderr, "  Contention ratio (σ)  : %.3f%s\n",
+            (double)p->contention_ratio,
+            (gpu_present && sigma_zero) ? "  [GPU present — CPU-only measurement, see WARNING above]" : "");
+
+    fprintf(stderr, "  Shared-bus procs      : %u%s\n",
+            p->shared_bus_procs,
+            gpu_present ? "  (CPU only; GPU not included)" : "");
     fprintf(stderr, "  Aligned group (4-bit) : %u weights  (target: %u-byte cache line)\n",
             p->aligned_group_128, p->cache_line_bytes);
     fprintf(stderr, "  Double-line group     : %u weights\n", p->aligned_group_256);

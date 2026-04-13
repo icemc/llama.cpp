@@ -40,10 +40,20 @@ typedef struct blaq_profile {
 // Runs a STREAM-style benchmark to estimate peak and contention bandwidth.
 //
 // gamma, beta: user-tunable scaling constants (safe defaults: 1.0, 1.0)
+// sigma_override: if >= 0.0, skip contention benchmark and use this value
+//                 directly for contention_ratio.  Pass -1.0f to auto-measure.
 //
 // Returns true on success.
 //
-bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta);
+bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta,
+                          float sigma_override);
+
+//
+// Returns true if a discrete or integrated GPU sharing the DRAM bus was
+// detected.  On such systems, CPU-only contention measurement underestimates
+// true sigma; pass an explicit sigma_override or use published specs.
+//
+bool blaq_gpu_on_shared_bus(void);
 
 //
 // Load / save a hardware profile as a minimal JSON file.
