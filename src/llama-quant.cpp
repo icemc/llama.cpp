@@ -1217,6 +1217,31 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         ::zeros(fout, meta_size);
     };
 
+    // BLAQ-Sched: pre-insert placeholder BLAQ metadata into ctx_outs[0] BEFORE
+    // new_ofstream() so that gguf_get_meta_size() already accounts for these keys.
+    // Without this, adding the keys after new_ofstream() grows the GGUF header beyond
+    // the placeholder space written to the file.  At read time, gguf_get_data_offset()
+    // would then point PAST the actual tensor data, causing:
+    //   "tensor '...' data is not within the file bounds"
+    // for the last tensor (which has zero alignment padding and no subsequent tensors
+    // to absorb the discrepancy).
+    //
+    // The placeholder is overwritten with real values after the quantization loop.
+    // Both placeholder and final write must use EXACTLY the same element count for
+    // blaq.bw_pressure (model.hparams.n_layer) so the header size stays constant.
+    if (!params->dry_run &&
+        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
+        const uint32_t n_layer = model.hparams.n_layer;
+        std::vector<float> bw_placeholder(n_layer, 0.0f);
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.cache_line_bytes",    0);
+        gguf_set_val_f32(ctx_outs[0].get(), "blaq.peak_bandwidth_gbs",  0.0f);
+        gguf_set_val_f32(ctx_outs[0].get(), "blaq.contention_ratio",    0.0f);
+        gguf_set_val_str(ctx_outs[0].get(), "blaq.swizzle",             "none");
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.layer_count",         n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.bw_pressure",
+                          GGUF_TYPE_FLOAT32, bw_placeholder.data(), n_layer);
+    }
+
     // no output file for --dry-run
     if (!params->dry_run) {
         new_ofstream(0);
@@ -1417,20 +1442,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } // no --dry-run
     } // main loop
 
-    // BLAQ-Sched: write per-layer bandwidth pressure metadata into the first output context.
-    // For single-file quantization (the common case), ctx_outs[0] is still open here.
-    // In keep_split mode, only the first shard gets these keys — a known limitation.
+    // BLAQ-Sched: overwrite the placeholder BLAQ metadata (pre-inserted before
+    // new_ofstream) with the real computed values.  Both writes must use exactly
+    // model.hparams.n_layer elements for blaq.bw_pressure so the header size is
+    // unchanged and the data section offset in the file remains correct.
     if (!params->dry_run &&
-        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) &&
-        !blaq_layer_cbw.empty()) {
+        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
+
+        const uint32_t n_layer = model.hparams.n_layer;
 
         float cbw_max = 1e-30f;
         for (const auto & kv : blaq_layer_cbw) cbw_max = std::max(cbw_max, kv.second);
 
-        std::vector<float> bw_pressure;
-        bw_pressure.reserve(blaq_layer_cbw.size());
+        // Allocate exactly n_layer entries (same as the placeholder) so the array
+        // size — and therefore the GGUF header size — does not change.
+        std::vector<float> bw_pressure(n_layer, 0.0f);
         for (const auto & kv : blaq_layer_cbw) {
-            bw_pressure.push_back(kv.second / cbw_max);
+            if (kv.first >= 0 && (uint32_t)kv.first < n_layer) {
+                bw_pressure[kv.first] = kv.second / cbw_max;
+            }
         }
 
         gguf_set_val_u32(ctx_outs[0].get(), "blaq.cache_line_bytes",
@@ -1440,14 +1470,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         gguf_set_val_f32(ctx_outs[0].get(), "blaq.contention_ratio",
                          qs.blaq_prof.contention_ratio);
         gguf_set_val_str(ctx_outs[0].get(), "blaq.swizzle", "none");
-        gguf_set_val_u32(ctx_outs[0].get(), "blaq.layer_count",
-                         (uint32_t)bw_pressure.size());
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.layer_count",         n_layer);
         gguf_set_arr_data(ctx_outs[0].get(), "blaq.bw_pressure",
-                          GGUF_TYPE_FLOAT32,
-                          bw_pressure.data(), bw_pressure.size());
+                          GGUF_TYPE_FLOAT32, bw_pressure.data(), n_layer);
 
-        LLAMA_LOG_INFO("%s: BLAQ-Sched: wrote bandwidth pressure for %zu layers\n",
-                       __func__, blaq_layer_cbw.size());
+        LLAMA_LOG_INFO("%s: BLAQ-Sched: wrote bandwidth pressure for %zu / %u layers\n",
+                       __func__, blaq_layer_cbw.size(), n_layer);
     }
 
     if (!params->dry_run) {
