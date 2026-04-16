@@ -265,6 +265,7 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 }
 
 // BLAQ_Q4_128: 128-weight block paired with Q8_0 activations (4 sub-blocks of 32)
+// Group-of-8 packing: qs[4g+k] lo=w_{8g+k}, hi=w_{8g+k+4}  →  pairs with qs[8g+k] and qs[8g+k+4]
 void ggml_vec_dot_blaq_q4_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     assert(n % QK_BLAQ_128 == 0);
@@ -282,24 +283,27 @@ void ggml_vec_dot_blaq_q4_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_
     float sumf = 0.f;
     for (int ib = 0; ib < nb; ++ib) {
         const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        // iterate over sub-blocks; each sub-block uses one Q8_0 activation block
         for (int s_idx = 0; s_idx < ratio; ++s_idx) {
             const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
-            const int base_j = s_idx * (QK8_0 / 2);
-            int sumi0 = 0, sumi1 = 0;
-            for (int j = 0; j < QK8_0 / 2; ++j) {
-                const int v0 = (x[ib].qs[base_j + j] & 0x0F) - 8;
-                const int v1 = (x[ib].qs[base_j + j] >>   4) - 8;
-                sumi0 += v0 * y[ib * ratio + s_idx].qs[j];
-                sumi1 += v1 * y[ib * ratio + s_idx].qs[j + QK8_0 / 2];
+            const int base_j = s_idx * (QK8_0 / 2); // byte offset into qs for this sub-block
+            int sumi = 0;
+            // 4 groups of 8 per sub-block; byte 4g+k: lo=w_{8g+k}, hi=w_{8g+k+4}
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
+                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
+                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
+                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                }
             }
-            sumf += dx * dy * (sumi0 + sumi1);
+            sumf += dx * dy * sumi;
         }
     }
     *s = sumf;
 }
 
 // BLAQ_Q4_256: 256-weight block paired with Q8_0 activations (8 sub-blocks of 32)
+// Group-of-8 packing: qs[4g+k] lo=w_{8g+k}, hi=w_{8g+k+4}  →  pairs with qs[8g+k] and qs[8g+k+4]
 void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     assert(n % QK_BLAQ_256 == 0);
@@ -320,14 +324,16 @@ void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_
         for (int s_idx = 0; s_idx < ratio; ++s_idx) {
             const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
             const int base_j = s_idx * (QK8_0 / 2);
-            int sumi0 = 0, sumi1 = 0;
-            for (int j = 0; j < QK8_0 / 2; ++j) {
-                const int v0 = (x[ib].qs[base_j + j] & 0x0F) - 8;
-                const int v1 = (x[ib].qs[base_j + j] >>   4) - 8;
-                sumi0 += v0 * y[ib * ratio + s_idx].qs[j];
-                sumi1 += v1 * y[ib * ratio + s_idx].qs[j + QK8_0 / 2];
+            int sumi = 0;
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
+                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
+                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
+                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                }
             }
-            sumf += dx * dy * (sumi0 + sumi1);
+            sumf += dx * dy * sumi;
         }
     }
     *s = sumf;
