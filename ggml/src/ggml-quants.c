@@ -5471,21 +5471,23 @@ static float blaq_find_scale_gs(const float * w, const float * imatrix,
     return 0.5f * (a + b);
 }
 
-// Pack one block using per-sub-block two-group nibble encoding.
+// Pack one block using group-of-8 nibble encoding.
+// qs[4g+k] lo nibble = w_{8g+k}, hi nibble = w_{8g+k+4},  for g=0..(qk/8-1), k=0..3.
+// Each int32 in the packed array holds 8 consecutive weights: lo=[w0..w3], hi=[w4..w7].
+// This lets the CUDA dp4a kernel use Q8_1 int32 pairs (u0, u1) directly without deinterleaving.
 // Both _ref (absmax) and _impl (imatrix-aware) call this helper.
 static void blaq_pack_block(const float * GGML_RESTRICT src,
                               uint8_t * GGML_RESTRICT qs,
                               int qk, float id) {
-    const int ratio = qk / QK8_0;
-    for (int s = 0; s < ratio; ++s) {
-        const float * sub = src + s * QK8_0;
-        const int base_j  = s  * (QK8_0 / 2);
-        for (int j = 0; j < QK8_0 / 2; ++j) {
-            int q0 = (int)roundf(sub[j]            * id) + 8;
-            int q1 = (int)roundf(sub[j + QK8_0/2]  * id) + 8;
+    const int ngroups = qk / 8;
+    for (int g = 0; g < ngroups; ++g) {
+        const float * w = src + g * 8;
+        for (int k = 0; k < 4; ++k) {
+            int q0 = (int)roundf(w[k]     * id) + 8;
+            int q1 = (int)roundf(w[k + 4] * id) + 8;
             q0 = q0 < 0 ? 0 : q0 > 15 ? 15 : q0;
             q1 = q1 < 0 ? 0 : q1 > 15 ? 15 : q1;
-            qs[base_j + j] = (uint8_t)(q0 | (q1 << 4));
+            qs[4*g + k] = (uint8_t)(q0 | (q1 << 4));
         }
     }
 }
@@ -5517,18 +5519,17 @@ void dequantize_row_blaq_q4_128(const block_blaq_q4_128 * GGML_RESTRICT x,
                                    float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_BLAQ_128 == 0);
     const int64_t nb = k / QK_BLAQ_128;
-    const int ratio = QK_BLAQ_128 / QK8_0;
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
         float * out = y + i * QK_BLAQ_128;
 
-        for (int s = 0; s < ratio; ++s) {
-            float * sub_out = out + s * QK8_0;
-            const int base_j = s * (QK8_0 / 2);
-            for (int j = 0; j < QK8_0 / 2; ++j) {
-                sub_out[j]            = ((x[i].qs[base_j + j] & 0x0F) - 8) * d;
-                sub_out[j + QK8_0/2] = ((x[i].qs[base_j + j] >>   4) - 8) * d;
+        const int ngroups = QK_BLAQ_128 / 8;
+        for (int g = 0; g < ngroups; ++g) {
+            float * w = out + g * 8;
+            for (int k = 0; k < 4; ++k) {
+                w[k]     = ((x[i].qs[4*g + k] & 0x0F) - 8) * d;
+                w[k + 4] = ((x[i].qs[4*g + k] >>   4) - 8) * d;
             }
         }
     }
@@ -5609,18 +5610,17 @@ void dequantize_row_blaq_q4_256(const block_blaq_q4_256 * GGML_RESTRICT x,
                                    float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_BLAQ_256 == 0);
     const int64_t nb = k / QK_BLAQ_256;
-    const int ratio = QK_BLAQ_256 / QK8_0;
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
         float * out = y + i * QK_BLAQ_256;
 
-        for (int s = 0; s < ratio; ++s) {
-            float * sub_out = out + s * QK8_0;
-            const int base_j = s * (QK8_0 / 2);
-            for (int j = 0; j < QK8_0 / 2; ++j) {
-                sub_out[j]            = ((x[i].qs[base_j + j] & 0x0F) - 8) * d;
-                sub_out[j + QK8_0/2] = ((x[i].qs[base_j + j] >>   4) - 8) * d;
+        const int ngroups = QK_BLAQ_256 / 8;
+        for (int g = 0; g < ngroups; ++g) {
+            float * w = out + g * 8;
+            for (int k = 0; k < 4; ++k) {
+                w[k]     = ((x[i].qs[4*g + k] & 0x0F) - 8) * d;
+                w[k + 4] = ((x[i].qs[4*g + k] >>   4) - 8) * d;
             }
         }
     }

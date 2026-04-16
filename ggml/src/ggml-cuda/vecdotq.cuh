@@ -671,9 +671,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 
 // BLAQ: Bandwidth- and Layout-Aware Quantization vec dot kernels (MMVQ)
 //
-// BLAQ uses adjacent nibble interleaving: qs[b] lo nibble = weight 2b, hi nibble = weight 2b+1.
-// This is the opposite of Q4_0's split layout (lo = weight b, hi = weight b+QK/2).
-// Matching the Q8_1 activations to BLAQ nibble positions requires byte-level deinterleaving.
+// BLAQ uses group-of-8 nibble packing: qs[4g+k] lo nibble = w_{8g+k}, hi nibble = w_{8g+k+4}.
+// Each packed int32 covers one group of 8 consecutive weights:
+//   lo = [w_{8g+0}..w_{8g+3}],  hi = [w_{8g+4}..w_{8g+7}]
+// Q8_1 activations arrive sequentially so u0=[a_{8g+0}..a_{8g+3}] and u1=[a_{8g+4}..a_{8g+7}]
+// pair directly with lo and hi — no byte deinterleaving needed.
 
 #define VDR_BLAQ_Q4_128_Q8_1_MMVQ 4
 #define VDR_BLAQ_Q4_128_Q8_1_MMQ  4
@@ -689,23 +691,16 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_128_q8_1(
 
 #pragma unroll
     for (int i = 0; i < VDR_BLAQ_Q4_128_Q8_1_MMVQ; ++i) {
-        // One BLAQ int32 = 4 bytes = 8 adjacent weights (even at lo nibbles, odd at hi nibbles)
+        // One BLAQ int32 = group of 8 weights: lo=[w_{8i+0}..w_{8i+3}], hi=[w_{8i+4}..w_{8i+7}]
         const int v  = get_int_b2(bq->qs, iqs + i);
-        const int lo = v & 0x0F0F0F0F;          // even-indexed weights: w_{8i}, w_{8i+2}, w_{8i+4}, w_{8i+6}
-        const int hi = (v >> 4) & 0x0F0F0F0F;   // odd-indexed weights:  w_{8i+1}, w_{8i+3}, w_{8i+5}, w_{8i+7}
+        const int lo = v & 0x0F0F0F0F;         // w_{8i+0}..w_{8i+3}
+        const int hi = (v >> 4) & 0x0F0F0F0F;  // w_{8i+4}..w_{8i+7}
 
         // Q8_1 activations for these 8 weights: two consecutive int32s covering a_{8i}..a_{8i+7}
-        const int u0 = get_int_b4(bq8->qs, 2*i + 0); // a_{8i+0}, a_{8i+1}, a_{8i+2}, a_{8i+3}
-        const int u1 = get_int_b4(bq8->qs, 2*i + 1); // a_{8i+4}, a_{8i+5}, a_{8i+6}, a_{8i+7}
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0); // a_{8i+0}..a_{8i+3}
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1); // a_{8i+4}..a_{8i+7}
 
-        // Deinterleave: gather even-position activations to match lo nibbles
-        const int u_even = (u0 & 0xFF)              | (((u0 >> 16) & 0xFF) <<  8) |
-                           ((u1 & 0xFF) << 16)       | (((u1 >> 16) & 0xFF) << 24);
-        // Gather odd-position activations to match hi nibbles
-        const int u_odd  = ((u0 >>  8) & 0xFF)      | (((u0 >> 24) & 0xFF) <<  8) |
-                           (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
-
-        sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
     }
 
     // Correction: each weight nibble has an implicit -8 offset; the partial sum bq8->ds.y = d*sum(a_i)
@@ -727,19 +722,15 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_256_q8_1(
 
 #pragma unroll
     for (int i = 0; i < VDR_BLAQ_Q4_256_Q8_1_MMVQ; ++i) {
+        // Group-of-8: lo=[w_{8i+0}..w_{8i+3}], hi=[w_{8i+4}..w_{8i+7}]
         const int v  = get_int_b2(bq->qs, iqs + i);
         const int lo = v & 0x0F0F0F0F;
         const int hi = (v >> 4) & 0x0F0F0F0F;
 
-        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
-        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0); // a_{8i+0}..a_{8i+3}
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1); // a_{8i+4}..a_{8i+7}
 
-        const int u_even = (u0 & 0xFF)               | (((u0 >> 16) & 0xFF) <<  8) |
-                           ((u1 & 0xFF) << 16)        | (((u1 >> 16) & 0xFF) << 24);
-        const int u_odd  = ((u0 >>  8) & 0xFF)       | (((u0 >> 24) & 0xFF) <<  8) |
-                           (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
-
-        sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
     }
 
     const float2 ds8f = __half22float2(bq8->ds);

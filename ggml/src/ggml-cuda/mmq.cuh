@@ -3217,8 +3217,9 @@ static __device__ __forceinline__ void mmq_write_back_mma(
 //
 // BLAQ uses adjacent nibble interleaving: qs[b] lo = weight 2b, hi = weight 2b+1.
 // The dp4a vec_dot deinterleaves Q8_1 activations to match the even/odd nibble grouping.
-// The MMA load_tiles interleaves adjacent nibbles to sequential order so the generic
-// vec_dot_q8_0_q8_1_mma function can operate correctly.
+// The MMA load_tiles converts group-of-8 nibble pairs to sequential int8 weights for
+// vec_dot_q8_0_q8_1_mma. With group-of-8 packing lo=[w0..w3] and hi=[w4..w7] are already
+// in sequential order so only the -8 offset correction is needed.
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_blaq_q4_128(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
@@ -3254,20 +3255,14 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         const int qs0 = get_int_b2(bxi->qs, kqsx);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        // MMA path: deinterleave adjacent nibbles to sequential order for vec_dot_q8_0_q8_1_mma.
-        // lo4 = [w_{8k}, w_{8k+2}, w_{8k+4}, w_{8k+6}] as bytes (even-indexed weights)
-        // hi4 = [w_{8k+1}, w_{8k+3}, w_{8k+5}, w_{8k+7}] as bytes (odd-indexed weights)
-        // seq01 = [w_{8k}, w_{8k+1}, w_{8k+2}, w_{8k+3}] (sequential, portable bit ops)
-        const int lo4  = (qs0 >> 0) & 0x0F0F0F0F;
-        const int hi4  = (qs0 >> 4) & 0x0F0F0F0F;
-        const int seq01 = (lo4 & 0x000000FF) | ((hi4 & 0x000000FF) << 8) |
-                          ((lo4 & 0x0000FF00) << 8) | ((hi4 & 0x0000FF00) << 16);
-        const int seq23 = ((lo4 >> 16) & 0x000000FF) | (((hi4 >> 16) & 0x000000FF) << 8) |
-                          (((lo4 >> 16) & 0x0000FF00) << 8) | (((hi4 >> 16) & 0x0000FF00) << 16);
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_128) + 2*kqsx + 0] = __vsubss4(seq01, 0x08080808);
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_128) + 2*kqsx + 1] = __vsubss4(seq23, 0x08080808);
+        // MMA path: group-of-8 packing → lo=[w_{8k+0}..w_{8k+3}], hi=[w_{8k+4}..w_{8k+7}]
+        // already sequential, just subtract the +8 quantization offset.
+        const int lo4 = qs0 & 0x0F0F0F0F;        // w_{8k+0}..w_{8k+3} as nibbles in bytes
+        const int hi4 = (qs0 >> 4) & 0x0F0F0F0F; // w_{8k+4}..w_{8k+7} as nibbles in bytes
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_128) + 2*kqsx + 0] = __vsubss4(lo4, 0x08080808);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_128) + 2*kqsx + 1] = __vsubss4(hi4, 0x08080808);
 #else
-        // DP4A path: store raw nibbles; vec_dot handles deinterleaving
+        // DP4A path: store raw nibbles; vec_dot_blaq_q4_128_q8_1_dp4a handles unpacking
         x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = qs0;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
@@ -3339,23 +3334,17 @@ static __device__ __forceinline__ void vec_dot_blaq_q4_128_q8_1_dp4a(
 
 #pragma unroll
                 for (int l = 0; l < VDR_BLAQ_Q4_128_Q8_1_MMQ; ++l) {
-                    // X tile: raw BLAQ nibbles at position k0/QR + l
+                    // X tile: raw BLAQ nibbles — group-of-8 packing
                     const int v  = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR_BLAQ_128 + l];
-                    const int lo = v & 0x0F0F0F0F;         // even-indexed weights
-                    const int hi = (v >> 4) & 0x0F0F0F0F;  // odd-indexed weights
+                    const int lo = v & 0x0F0F0F0F;         // w_{8l+0}..w_{8l+3}
+                    const int hi = (v >> 4) & 0x0F0F0F0F;  // w_{8l+4}..w_{8l+7}
 
                     // Y tile: consecutive int32 pair covering activations a_{8l}..a_{8l+7}
-                    const int u0 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 0];
-                    const int u1 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 1];
+                    const int u0 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 0]; // a_{8l+0}..a_{8l+3}
+                    const int u1 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 1]; // a_{8l+4}..a_{8l+7}
 
-                    // Deinterleave: u_even = a_{8l+0},a_{8l+2},a_{8l+4},a_{8l+6}
-                    //               u_odd  = a_{8l+1},a_{8l+3},a_{8l+5},a_{8l+7}
-                    const int u_even = (u0 & 0xFF)               | (((u0 >> 16) & 0xFF) <<  8) |
-                                       ((u1 & 0xFF) << 16)        | (((u1 >> 16) & 0xFF) << 24);
-                    const int u_odd  = ((u0 >>  8) & 0xFF)       | (((u0 >> 24) & 0xFF) <<  8) |
-                                       (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
-
-                    sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+                    // Group-of-8 packing: lo pairs directly with u0, hi pairs directly with u1
+                    sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
                 }
 
                 // Scale: one per BLAQ block; kbxd = k0 / (QR * QI) = k0/32
@@ -3406,14 +3395,11 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         const int qs0 = get_int_b2(bxi->qs, kqsx);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        const int lo4   = (qs0 >> 0) & 0x0F0F0F0F;
-        const int hi4   = (qs0 >> 4) & 0x0F0F0F0F;
-        const int seq01 = (lo4 & 0x000000FF) | ((hi4 & 0x000000FF) << 8) |
-                          ((lo4 & 0x0000FF00) << 8) | ((hi4 & 0x0000FF00) << 16);
-        const int seq23 = ((lo4 >> 16) & 0x000000FF) | (((hi4 >> 16) & 0x000000FF) << 8) |
-                          (((lo4 >> 16) & 0x0000FF00) << 8) | (((hi4 >> 16) & 0x0000FF00) << 16);
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_256) + 2*kqsx + 0] = __vsubss4(seq01, 0x08080808);
-        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_256) + 2*kqsx + 1] = __vsubss4(seq23, 0x08080808);
+        // Group-of-8 packing: lo=[w_{8k+0}..w_{8k+3}], hi=[w_{8k+4}..w_{8k+7}] already sequential
+        const int lo4 = qs0 & 0x0F0F0F0F;
+        const int hi4 = (qs0 >> 4) & 0x0F0F0F0F;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_256) + 2*kqsx + 0] = __vsubss4(lo4, 0x08080808);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(2*QI_BLAQ_256) + 2*kqsx + 1] = __vsubss4(hi4, 0x08080808);
 #else
         x_qs[i*(MMQ_TILE_NE_K + 1) + txi] = qs0;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -3480,19 +3466,15 @@ static __device__ __forceinline__ void vec_dot_blaq_q4_256_q8_1_dp4a(
 
 #pragma unroll
                 for (int l = 0; l < VDR_BLAQ_Q4_256_Q8_1_MMQ; ++l) {
+                    // Group-of-8 packing: lo=[w_{8l+0}..w_{8l+3}], hi=[w_{8l+4}..w_{8l+7}]
                     const int v  = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR_BLAQ_256 + l];
                     const int lo = v & 0x0F0F0F0F;
                     const int hi = (v >> 4) & 0x0F0F0F0F;
 
-                    const int u0 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 0];
-                    const int u1 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 1];
+                    const int u0 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 0]; // a_{8l+0}..a_{8l+3}
+                    const int u1 = y_qs[j*MMQ_TILE_Y_K + kyqs + 2*l + 1]; // a_{8l+4}..a_{8l+7}
 
-                    const int u_even = (u0 & 0xFF)               | (((u0 >> 16) & 0xFF) <<  8) |
-                                       ((u1 & 0xFF) << 16)        | (((u1 >> 16) & 0xFF) << 24);
-                    const int u_odd  = ((u0 >>  8) & 0xFF)       | (((u0 >> 24) & 0xFF) <<  8) |
-                                       (((u1 >>  8) & 0xFF) << 16) | (((u1 >> 24) & 0xFF) << 24);
-
-                    sumi = ggml_cuda_dp4a(lo, u_even, ggml_cuda_dp4a(hi, u_odd, sumi));
+                    sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
                 }
 
                 // BLAQ_Q4_256: single block spans both k00=0 and k00=32 → kbxd always 0
