@@ -91,9 +91,6 @@ static uint32_t detect_cache_line_bytes() {
         }
     }
 #endif
-#if defined(__aarch64__)
-    return 64;   // conservative ARM default; Apple Silicon reports 128 via sysctl above
-#endif
     return 64;
 }
 
@@ -388,6 +385,7 @@ static double cuda_stream_benchmark(int n_runs, bw_stats_t * stats_out) {
     if (stats_out) memset(stats_out, 0, sizeof(*stats_out));
 
 #if defined(__APPLE__)
+    (void)n_runs;
     return 0.0;
 #else
 #if defined(__linux__)
@@ -689,11 +687,10 @@ bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta,
     //   - Apple UMA:  CPU STREAM benchmark == GPU BW (same physical DRAM)
     //   - CPU-only:   CPU STREAM benchmark
 
-#if !defined(__APPLE__)
-    blaq_nvml_gpu_t nvml_gpu = {};
-    bool gpu_found = nvml_query_first_gpu(&nvml_gpu);
-#else
+    blaq_nvml_gpu_t nvml_gpu = {};  // zero-init; only populated on non-Apple
     bool gpu_found = false;
+#if !defined(__APPLE__)
+    gpu_found = nvml_query_first_gpu(&nvml_gpu);
 #endif
 
     if (gpu_found) {

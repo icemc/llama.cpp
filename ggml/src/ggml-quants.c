@@ -5527,9 +5527,9 @@ void dequantize_row_blaq_q4_128(const block_blaq_q4_128 * GGML_RESTRICT x,
         const int ngroups = QK_BLAQ_128 / 8;
         for (int g = 0; g < ngroups; ++g) {
             float * w = out + g * 8;
-            for (int k = 0; k < 4; ++k) {
-                w[k]     = ((x[i].qs[4*g + k] & 0x0F) - 8) * d;
-                w[k + 4] = ((x[i].qs[4*g + k] >>   4) - 8) * d;
+            for (int j = 0; j < 4; ++j) {
+                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
+                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
             }
         }
     }
@@ -5618,9 +5618,9 @@ void dequantize_row_blaq_q4_256(const block_blaq_q4_256 * GGML_RESTRICT x,
         const int ngroups = QK_BLAQ_256 / 8;
         for (int g = 0; g < ngroups; ++g) {
             float * w = out + g * 8;
-            for (int k = 0; k < 4; ++k) {
-                w[k]     = ((x[i].qs[4*g + k] & 0x0F) - 8) * d;
-                w[k + 4] = ((x[i].qs[4*g + k] >>   4) - 8) * d;
+            for (int j = 0; j < 4; ++j) {
+                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
+                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
             }
         }
     }
