@@ -5440,51 +5440,67 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 // Shared helpers
 // ----------------------------------------------------------------
 
-// Golden-section search: find d* = argmin_d sum_j I[j]*(w[j]-Q(w[j],d))^2
-// ~30 iterations for ~1e-6 relative tolerance.
-static float blaq_find_scale_gs(const float * w, const float * imatrix,
-                                  int n, float d_lo, float d_hi) {
-    static const float phi = 0.6180339887f;
-    float a = d_lo, b = d_hi;
-    float c = b - phi * (b - a);
-    float d = a + phi * (b - a);
-
-    for (int iter = 0; iter < 30; ++iter) {
-        float fc = 0.f, fd = 0.f;
-        for (int j = 0; j < n; ++j) {
-            const float im_j = imatrix ? imatrix[j] : 1.f;
-
-            float qc = roundf(w[j] / c);
-            qc = qc < -8.f ? -8.f : qc > 7.f ? 7.f : qc;
-            const float dc = w[j] - qc * c;
-            fc += im_j * dc * dc;
-
-            float qd = roundf(w[j] / d);
-            qd = qd < -8.f ? -8.f : qd > 7.f ? 7.f : qd;
-            const float dd = w[j] - qd * d;
-            fd += im_j * dd * dd;
-        }
-        if (fc < fd) { b = d; } else { a = c; }
-        c = b - phi * (b - a);
-        d = a + phi * (b - a);
+// Coordinate-descent solver for asymmetric quantization.
+// Finds (d*, m*) = argmin_{d,m} sum_j imatrix[j] * (w[j] - q[j]*d - m)^2
+// where q[j] = clip(round((w[j]-m)/d), 0, 15).
+// Solves the 2×2 weighted least-squares system for (d,m) at each step.
+static void blaq_find_scale_asym(const float * w, const float * imatrix,
+                                   int n, float * out_d, float * out_m) {
+    float xmin = w[0], xmax = w[0];
+    for (int j = 1; j < n; ++j) {
+        if (w[j] < xmin) xmin = w[j];
+        if (w[j] > xmax) xmax = w[j];
     }
-    return 0.5f * (a + b);
+
+    const float range = xmax - xmin;
+    if (range == 0.f) {
+        *out_d = 0.f;
+        *out_m = xmin;
+        return;
+    }
+
+    float d = range / 15.f;
+    float m = xmin;
+
+    for (int iter = 0; iter < 8; ++iter) {
+        const float id = 1.f / d;
+        float S0 = 0.f, Sq = 0.f, Sqq = 0.f, Sx = 0.f, Sqx = 0.f;
+        for (int j = 0; j < n; ++j) {
+            const float wj = imatrix ? imatrix[j] : 1.f;
+            float qf = roundf((w[j] - m) * id);
+            qf = qf < 0.f ? 0.f : qf > 15.f ? 15.f : qf;
+            S0  += wj;
+            Sq  += wj * qf;
+            Sqq += wj * qf * qf;
+            Sx  += wj * w[j];
+            Sqx += wj * qf * w[j];
+        }
+        // Solve 2×2 system: [Sqq Sq; Sq S0] [d; m] = [Sqx; Sx]
+        const float det = Sqq * S0 - Sq * Sq;
+        if (fabsf(det) < 1e-12f) break;
+        const float new_d = (Sqx * S0 - Sx  * Sq) / det;
+        const float new_m = (Sqq * Sx  - Sq  * Sqx) / det;
+        if (new_d <= 0.f) break;
+        d = new_d;
+        m = new_m;
+    }
+
+    *out_d = d;
+    *out_m = m;
 }
 
 // Pack one block using group-of-8 nibble encoding.
-// qs[4g+k] lo nibble = w_{8g+k}, hi nibble = w_{8g+k+4},  for g=0..(qk/8-1), k=0..3.
-// Each int32 in the packed array holds 8 consecutive weights: lo=[w0..w3], hi=[w4..w7].
-// This lets the CUDA dp4a kernel use Q8_1 int32 pairs (u0, u1) directly without deinterleaving.
-// Both _ref (absmax) and _impl (imatrix-aware) call this helper.
+// qs[4g+k] lo nibble = w_{8g+k}, hi nibble = w_{8g+k+4}, for g=0..(qk/8-1), k=0..3.
+// Asymmetric: q = clip(round((x - m) * id), 0, 15), where id = 1/d.
 static void blaq_pack_block(const float * GGML_RESTRICT src,
                               uint8_t * GGML_RESTRICT qs,
-                              int qk, float id) {
+                              int qk, float id, float m) {
     const int ngroups = qk / 8;
     for (int g = 0; g < ngroups; ++g) {
         const float * w = src + g * 8;
         for (int k = 0; k < 4; ++k) {
-            int q0 = (int)roundf(w[k]     * id) + 8;
-            int q1 = (int)roundf(w[k + 4] * id) + 8;
+            int q0 = (int)roundf((w[k]     - m) * id);
+            int q1 = (int)roundf((w[k + 4] - m) * id);
             q0 = q0 < 0 ? 0 : q0 > 15 ? 15 : q0;
             q1 = q1 < 0 ? 0 : q1 > 15 ? 15 : q1;
             qs[4*g + k] = (uint8_t)(q0 | (q1 << 4));
@@ -5505,13 +5521,18 @@ void quantize_row_blaq_q4_128_ref(const float * GGML_RESTRICT x,
     for (int64_t i = 0; i < nb; ++i) {
         const float * src = x + i * QK_BLAQ_128;
 
-        float amax = 0.f;
-        for (int j = 0; j < QK_BLAQ_128; ++j) amax = fmaxf(amax, fabsf(src[j]));
-        const float d = amax / 7.f;
+        float xmin = src[0], xmax = src[0];
+        for (int j = 1; j < QK_BLAQ_128; ++j) {
+            xmin = fminf(xmin, src[j]);
+            xmax = fmaxf(xmax, src[j]);
+        }
+        const float d = (xmax - xmin) / 15.f;
+        const float m = xmin;
         y[i].d = GGML_FP32_TO_FP16(d);
-        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_128 / 2); continue; }
+        y[i].m = GGML_FP32_TO_FP16(m);
+        if (d == 0.f) { memset(y[i].qs, 0, QK_BLAQ_128 / 2); continue; }
 
-        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, 1.f / d);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, 1.f / d, m);
     }
 }
 
@@ -5522,14 +5543,15 @@ void dequantize_row_blaq_q4_128(const block_blaq_q4_128 * GGML_RESTRICT x,
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
         float * out = y + i * QK_BLAQ_128;
 
         const int ngroups = QK_BLAQ_128 / 8;
         for (int g = 0; g < ngroups; ++g) {
             float * w = out + g * 8;
             for (int j = 0; j < 4; ++j) {
-                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
-                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
+                w[j]     = (x[i].qs[4*g + j] & 0x0F) * d + m;
+                w[j + 4] = (x[i].qs[4*g + j] >>   4) * d + m;
             }
         }
     }
@@ -5549,18 +5571,16 @@ static void quantize_row_blaq_q4_128_impl(const float * GGML_RESTRICT x,
         for (int j = 0; j < QK_BLAQ_128; ++j) amax = fmaxf(amax, fabsf(src[j]));
         if (amax == 0.f) {
             y[i].d = GGML_FP32_TO_FP16(0.f);
-            memset(y[i].qs, 0x88, QK_BLAQ_128 / 2);
+            y[i].m = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].qs, 0, QK_BLAQ_128 / 2);
             continue;
         }
 
-        float d;
-        if (im) {
-            d = blaq_find_scale_gs(src, im, QK_BLAQ_128, amax / 15.f, amax / 7.f);
-        } else {
-            d = amax / 7.f;
-        }
+        float d, m;
+        blaq_find_scale_asym(src, im, QK_BLAQ_128, &d, &m);
         y[i].d = GGML_FP32_TO_FP16(d);
-        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, (d > 0.f) ? 1.f / d : 0.f);
+        y[i].m = GGML_FP32_TO_FP16(m);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_128, (d > 0.f) ? 1.f / d : 0.f, m);
     }
 }
 
@@ -5596,13 +5616,18 @@ void quantize_row_blaq_q4_256_ref(const float * GGML_RESTRICT x,
     for (int64_t i = 0; i < nb; ++i) {
         const float * src = x + i * QK_BLAQ_256;
 
-        float amax = 0.f;
-        for (int j = 0; j < QK_BLAQ_256; ++j) amax = fmaxf(amax, fabsf(src[j]));
-        const float d = amax / 7.f;
+        float xmin = src[0], xmax = src[0];
+        for (int j = 1; j < QK_BLAQ_256; ++j) {
+            xmin = fminf(xmin, src[j]);
+            xmax = fmaxf(xmax, src[j]);
+        }
+        const float d = (xmax - xmin) / 15.f;
+        const float m = xmin;
         y[i].d = GGML_FP32_TO_FP16(d);
-        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_256 / 2); continue; }
+        y[i].m = GGML_FP32_TO_FP16(m);
+        if (d == 0.f) { memset(y[i].qs, 0, QK_BLAQ_256 / 2); continue; }
 
-        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, 1.f / d);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, 1.f / d, m);
     }
 }
 
@@ -5613,14 +5638,15 @@ void dequantize_row_blaq_q4_256(const block_blaq_q4_256 * GGML_RESTRICT x,
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
         float * out = y + i * QK_BLAQ_256;
 
         const int ngroups = QK_BLAQ_256 / 8;
         for (int g = 0; g < ngroups; ++g) {
             float * w = out + g * 8;
             for (int j = 0; j < 4; ++j) {
-                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
-                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
+                w[j]     = (x[i].qs[4*g + j] & 0x0F) * d + m;
+                w[j + 4] = (x[i].qs[4*g + j] >>   4) * d + m;
             }
         }
     }
@@ -5640,18 +5666,16 @@ static void quantize_row_blaq_q4_256_impl(const float * GGML_RESTRICT x,
         for (int j = 0; j < QK_BLAQ_256; ++j) amax = fmaxf(amax, fabsf(src[j]));
         if (amax == 0.f) {
             y[i].d = GGML_FP32_TO_FP16(0.f);
-            memset(y[i].qs, 0x88, QK_BLAQ_256 / 2);
+            y[i].m = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].qs, 0, QK_BLAQ_256 / 2);
             continue;
         }
 
-        float d;
-        if (im) {
-            d = blaq_find_scale_gs(src, im, QK_BLAQ_256, amax / 15.f, amax / 7.f);
-        } else {
-            d = amax / 7.f;
-        }
+        float d, m;
+        blaq_find_scale_asym(src, im, QK_BLAQ_256, &d, &m);
         y[i].d = GGML_FP32_TO_FP16(d);
-        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, (d > 0.f) ? 1.f / d : 0.f);
+        y[i].m = GGML_FP32_TO_FP16(m);
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_256, (d > 0.f) ? 1.f / d : 0.f, m);
     }
 }
 

@@ -539,6 +539,62 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
     dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
+// BLAQ group-of-8 packing: qs[4g+k] lo = w[8g+k], hi = w[8g+k+4]
+// BLAQ-128: 16 groups per block, 32 threads (16 per BLAQ block → 2 blocks per CUDA block)
+template<typename dst_t>
+static __global__ void dequantize_block_blaq_q4_128_k(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
+    const int64_t i   = blockIdx.x;
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid % 16;  // group index within block (0..15)
+    const int64_t ir  = tid / 16;  // which of the 2 BLAQ blocks in this CUDA block
+    const int64_t ib  = 2*i + ir;
+    if (ib >= nb) { return; }
+
+    dst_t * y = yy + ib * (int64_t)QK_BLAQ_128;
+
+    const block_blaq_q4_128 * x = (const block_blaq_q4_128 *)vx + ib;
+    const float d = __half2float(x->dm.x);
+    const float m = __half2float(x->dm.y);
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int k = 0; k < 4; ++k) {
+        y[8*il + k    ] = ggml_cuda_cast<dst_t>((q[k] & 0x0F) * d + m);
+        y[8*il + k + 4] = ggml_cuda_cast<dst_t>((q[k] >>  4)  * d + m);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_blaq_q4_128_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_BLAQ_128;
+    dequantize_block_blaq_q4_128_k<<<(nb + 1) / 2, 32, 0, stream>>>(vx, y, nb);
+}
+
+// BLAQ-256: 32 groups per block, 32 threads = 1 block per CUDA block
+template<typename dst_t>
+static __global__ void dequantize_block_blaq_q4_256_k(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb) {
+    const int64_t ib = blockIdx.x;
+    const int64_t il = threadIdx.x;  // group index (0..31)
+    if (ib >= nb) { return; }
+
+    dst_t * y = yy + ib * (int64_t)QK_BLAQ_256;
+
+    const block_blaq_q4_256 * x = (const block_blaq_q4_256 *)vx + ib;
+    const float d = __half2float(x->dm.x);
+    const float m = __half2float(x->dm.y);
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int k = 0; k < 4; ++k) {
+        y[8*il + k    ] = ggml_cuda_cast<dst_t>((q[k] & 0x0F) * d + m);
+        y[8*il + k + 4] = ggml_cuda_cast<dst_t>((q[k] >>  4)  * d + m);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_blaq_q4_256_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_BLAQ_256;
+    dequantize_block_blaq_q4_256_k<<<nb, 32, 0, stream>>>(vx, y, nb);
+}
+
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
@@ -756,6 +812,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_BLAQ_Q4_128:
+            return dequantize_row_blaq_q4_128_cuda;
+        case GGML_TYPE_BLAQ_Q4_256:
+            return dequantize_row_blaq_q4_256_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -809,6 +869,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_BLAQ_Q4_128:
+            return dequantize_row_blaq_q4_128_cuda;
+        case GGML_TYPE_BLAQ_Q4_256:
+            return dequantize_row_blaq_q4_256_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

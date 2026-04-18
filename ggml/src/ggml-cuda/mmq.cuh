@@ -3295,9 +3295,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         const block_blaq_q4_128 * bxi = (const block_blaq_q4_128 *) x + kbx0 + i*stride + blaq_kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = __half2float(bxi->d);
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = __half22float2(bxi->dm).x;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_BLAQ_128) + i/QI_BLAQ_128 + kbxd] = __half2float(bxi->d);
+        x_df[i*(MMQ_TILE_NE_K/QI_BLAQ_128) + i/QI_BLAQ_128 + kbxd] = __half22float2(bxi->dm).x;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -3430,9 +3430,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         const block_blaq_q4_256 * bxi = (const block_blaq_q4_256 *) x + kbx0 + i*stride + blaq_kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = __half2float(bxi->d);
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = __half22float2(bxi->dm).x;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_BLAQ_256) + i/QI_BLAQ_256 + kbxd] = __half2float(bxi->d);
+        x_df[i*(MMQ_TILE_NE_K/QI_BLAQ_256) + i/QI_BLAQ_256 + kbxd] = __half22float2(bxi->dm).x;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

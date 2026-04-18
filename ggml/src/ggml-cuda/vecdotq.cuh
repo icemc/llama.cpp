@@ -703,10 +703,12 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_128_q8_1(
         sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
     }
 
-    // Correction: each weight nibble has an implicit -8 offset; the partial sum bq8->ds.y = d*sum(a_i)
-    // covers all 32 activations in the Q8_1 block matched by this thread (VDR=4 → one full Q8_1 block).
-    const float2 ds8f = __half22float2(bq8->ds);
-    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+    // Asymmetric: weight = q*d + m. dot = d * sum(q_j*a_j) * d_a + m * d_a * sum(a_j)
+    //   = dm.x * sumi * ds8f.x + dm.y * ds8f.y
+    // where ds8f.x = d_a, ds8f.y = d_a * sum(a_j)
+    const float2 dm128 = __half22float2(bq->dm);
+    const float2 ds8f  = __half22float2(bq8->ds);
+    return dm128.x * (float)sumi * ds8f.x + dm128.y * ds8f.y;
 }
 
 #define VDR_BLAQ_Q4_256_Q8_1_MMVQ 4
@@ -733,8 +735,9 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_256_q8_1(
         sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
     }
 
-    const float2 ds8f = __half22float2(bq8->ds);
-    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+    const float2 dm256 = __half22float2(bq->dm);
+    const float2 ds8f  = __half22float2(bq8->ds);
+    return dm256.x * (float)sumi * ds8f.x + dm256.y * ds8f.y;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

@@ -67,30 +67,21 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
 static __device__ __forceinline__ void dequantize_blaq_q4_128(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_blaq_q4_128 * x = (const block_blaq_q4_128 *) vx;
 
-    const float d = __half2float(x[ib].d);
-
-    // BLAQ adjacent nibble layout: qs[b] lo = weight 2b, hi = weight 2b+1
+    const float2 dm = __half22float2(x[ib].dm);
     const int vui = x[ib].qs[iqs];
 
-    v.x = (vui & 0xF) - 8.0f;   // even-indexed weight
-    v.y = (vui >>  4) - 8.0f;   // odd-indexed weight
-
-    v.x *= d;
-    v.y *= d;
+    v.x = (vui & 0xF) * dm.x + dm.y;
+    v.y = (vui >>  4) * dm.x + dm.y;
 }
 
 static __device__ __forceinline__ void dequantize_blaq_q4_256(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_blaq_q4_256 * x = (const block_blaq_q4_256 *) vx;
 
-    const float d = __half2float(x[ib].d);
-
+    const float2 dm = __half22float2(x[ib].dm);
     const int vui = x[ib].qs[iqs];
 
-    v.x = (vui & 0xF) - 8.0f;
-    v.y = (vui >>  4) - 8.0f;
-
-    v.x *= d;
-    v.y *= d;
+    v.x = (vui & 0xF) * dm.x + dm.y;
+    v.y = (vui >>  4) * dm.x + dm.y;
 }
 
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){

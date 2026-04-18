@@ -264,8 +264,8 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
-// BLAQ_Q4_128: 128-weight block paired with Q8_0 activations (4 sub-blocks of 32)
-// Group-of-8 packing: qs[4g+k] lo=w_{8g+k}, hi=w_{8g+k+4}  →  pairs with qs[8g+k] and qs[8g+k+4]
+// BLAQ_Q4_128: 128-weight block (asymmetric) paired with Q8_0 activations.
+// dot = d_w * d_a * sum(q_j * a_j) + m_w * d_a * sum(a_j)
 void ggml_vec_dot_blaq_q4_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     assert(n % QK_BLAQ_128 == 0);
@@ -277,33 +277,35 @@ void ggml_vec_dot_blaq_q4_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_
     const block_blaq_q4_128 * GGML_RESTRICT x = vx;
     const block_q8_0        * GGML_RESTRICT y = vy;
 
-    const int nb     = n / QK_BLAQ_128;
-    const int ratio  = QK_BLAQ_128 / QK8_0; // 4 sub-blocks per BLAQ block
+    const int nb    = n / QK_BLAQ_128;
+    const int ratio = QK_BLAQ_128 / QK8_0; // 4 sub-blocks per BLAQ block
 
     float sumf = 0.f;
     for (int ib = 0; ib < nb; ++ib) {
         const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float mx = GGML_CPU_FP16_TO_FP32(x[ib].m);
         for (int s_idx = 0; s_idx < ratio; ++s_idx) {
             const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
-            const int base_j = s_idx * (QK8_0 / 2); // byte offset into qs for this sub-block
-            int sumi = 0;
-            // 4 groups of 8 per sub-block; byte 4g+k: lo=w_{8g+k}, hi=w_{8g+k+4}
+            const int base_j = s_idx * (QK8_0 / 2);
+            int sumi = 0, sum_a = 0;
             for (int g = 0; g < QK8_0 / 8; ++g) {
                 for (int k = 0; k < 4; ++k) {
-                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
-                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
-                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
-                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    const int q0 = x[ib].qs[base_j + 4*g + k] & 0x0F;
+                    const int q1 = x[ib].qs[base_j + 4*g + k] >>   4;
+                    const int a0 = y[ib * ratio + s_idx].qs[8*g + k];
+                    const int a1 = y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    sumi  += q0 * a0 + q1 * a1;
+                    sum_a += a0 + a1;
                 }
             }
-            sumf += dx * dy * sumi;
+            sumf += dy * (dx * sumi + mx * sum_a);
         }
     }
     *s = sumf;
 }
 
-// BLAQ_Q4_256: 256-weight block paired with Q8_0 activations (8 sub-blocks of 32)
-// Group-of-8 packing: qs[4g+k] lo=w_{8g+k}, hi=w_{8g+k+4}  →  pairs with qs[8g+k] and qs[8g+k+4]
+// BLAQ_Q4_256: 256-weight block (asymmetric) paired with Q8_0 activations.
+// dot = d_w * d_a * sum(q_j * a_j) + m_w * d_a * sum(a_j)
 void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     assert(n % QK_BLAQ_256 == 0);
@@ -315,25 +317,28 @@ void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_
     const block_blaq_q4_256 * GGML_RESTRICT x = vx;
     const block_q8_0         * GGML_RESTRICT y = vy;
 
-    const int nb     = n / QK_BLAQ_256;
-    const int ratio  = QK_BLAQ_256 / QK8_0; // 8 sub-blocks per BLAQ block
+    const int nb    = n / QK_BLAQ_256;
+    const int ratio = QK_BLAQ_256 / QK8_0; // 8 sub-blocks per BLAQ block
 
     float sumf = 0.f;
     for (int ib = 0; ib < nb; ++ib) {
         const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float mx = GGML_CPU_FP16_TO_FP32(x[ib].m);
         for (int s_idx = 0; s_idx < ratio; ++s_idx) {
             const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
             const int base_j = s_idx * (QK8_0 / 2);
-            int sumi = 0;
+            int sumi = 0, sum_a = 0;
             for (int g = 0; g < QK8_0 / 8; ++g) {
                 for (int k = 0; k < 4; ++k) {
-                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
-                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
-                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
-                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    const int q0 = x[ib].qs[base_j + 4*g + k] & 0x0F;
+                    const int q1 = x[ib].qs[base_j + 4*g + k] >>   4;
+                    const int a0 = y[ib * ratio + s_idx].qs[8*g + k];
+                    const int a1 = y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    sumi  += q0 * a0 + q1 * a1;
+                    sum_a += a0 + a1;
                 }
             }
-            sumf += dx * dy * sumi;
+            sumf += dy * (dx * sumi + mx * sum_a);
         }
     }
     *s = sumf;
