@@ -48,10 +48,10 @@ static void print_usage(const char * prog) {
         "  %s --in blaq-prof_apple_m1_8gb.json # inspect saved profile\n"
         "\n"
         "Naming convention for profiles:\n"
-        "  blaq-prof_<vendor>_<chip>_<ram>gb.json\n"
-        "  e.g.  blaq-prof_apple_m1_8gb.json\n"
-        "        blaq-prof_nvidia_gh100_128gb.json\n"
-        "        blaq-prof_intel_core-ultra9_32gb.json\n"
+        "  blaq_profile_<vendor>_<chip>_<ram>gb.json\n"
+        "  e.g.  blaq_profile_apple_m1_8gb.json\n"
+        "        blaq_profile_nvidia_gh100_128gb.json\n"
+        "        blaq_profile_intel_core-ultra9_32gb.json\n"
         "\n",
         prog, prog, prog, prog, prog);
 }
@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  gamma=%.2f  beta=%.2f\n\n", (double)gamma, (double)beta);
 
     fprintf(stderr, "Step 1/4  detecting cache-line size ...\n");
-    fprintf(stderr, "Step 2/4  measuring peak bandwidth ...\n");
+    fprintf(stderr, "Step 2/4  detecting GPU / measuring peak bandwidth ...\n");
     fprintf(stderr, "Step 3/4  counting shared-bus processors ...\n");
     if (sigma_override >= 0.f) {
         fprintf(stderr, "Step 4/4  contention benchmark skipped"

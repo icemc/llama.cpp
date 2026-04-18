@@ -37,6 +37,7 @@
 
 #if defined(__linux__)
 #  include <unistd.h>    // sysconf, access
+#  include <dlfcn.h>     // dlopen/dlsym for NVML dynamic loading
 #endif
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
@@ -220,6 +221,293 @@ bool blaq_gpu_on_shared_bus(void) {
 }
 
 // ---------------------------------------------------------------------------
+// NVML GPU detection (dynamically loaded — no hard link dependency)
+// ---------------------------------------------------------------------------
+//
+// On NVIDIA systems, NVML gives us:
+//   - GPU name (e.g. "NVIDIA GeForce RTX 3070 Ti")
+//   - Total VRAM
+//   - Memory bus width (bits) and max memory clock (MHz)
+//   - Theoretical peak BW = (bus_width/8) * clock_MHz * 2 * 1e6   (DDR formula)
+//
+// Dynamic loading means the binary runs on non-NVIDIA hardware without
+// needing libnvidia-ml installed.
+
+#define BLAQ_NVML_SUCCESS  0
+#define BLAQ_NVML_CLOCK_MEM 2
+
+typedef int   blaq_nvml_return_t;
+typedef void *blaq_nvml_device_t;
+typedef struct { unsigned long long total, free, used; } blaq_nvml_memory_t;
+
+typedef blaq_nvml_return_t (*pfn_nvmlInit)(void);
+typedef blaq_nvml_return_t (*pfn_nvmlShutdown)(void);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetCount)(unsigned int *);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetHandleByIndex)(unsigned int, blaq_nvml_device_t *);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetName)(blaq_nvml_device_t, char *, unsigned int);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetMemoryInfo)(blaq_nvml_device_t, blaq_nvml_memory_t *);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetMemoryBusWidth)(blaq_nvml_device_t, unsigned int *);
+typedef blaq_nvml_return_t (*pfn_nvmlDeviceGetMaxClockInfo)(blaq_nvml_device_t, int, unsigned int *);
+
+struct blaq_nvml_gpu_t {
+    char     name[256];
+    uint64_t vram_bytes;
+    uint32_t bus_width_bits;
+    uint32_t mem_clock_mhz;
+    double   peak_bw_bytes_per_sec;
+    bool     valid;
+};
+
+static bool nvml_query_first_gpu(blaq_nvml_gpu_t * out) {
+    memset(out, 0, sizeof(*out));
+
+#if defined(__APPLE__)
+    (void)out;
+    return false;  // Apple Silicon uses sysctl, not NVML
+#else
+
+#if defined(__linux__)
+    void * lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libnvidia-ml.so",   RTLD_LAZY | RTLD_LOCAL);
+#elif defined(_WIN32)
+    void * lib = (void *)LoadLibraryA("nvml.dll");
+    if (!lib) {
+        char path[MAX_PATH];
+        const char * pf = getenv("ProgramFiles");
+        snprintf(path, sizeof(path), "%s\\NVIDIA Corporation\\NVSMI\\nvml.dll",
+                 pf ? pf : "C:\\Program Files");
+        lib = (void *)LoadLibraryA(path);
+    }
+#else
+    void * lib = nullptr;
+#endif
+    if (!lib) return false;
+
+#if defined(__linux__)
+#  define BLAQ_DLSYM(name) dlsym(lib, name)
+#elif defined(_WIN32)
+#  define BLAQ_DLSYM(name) (void *)GetProcAddress((HMODULE)lib, name)
+#else
+#  define BLAQ_DLSYM(name) nullptr
+#endif
+
+    // Prefer versioned v2 symbols; fall back to v1
+    pfn_nvmlInit init_fn =
+        (pfn_nvmlInit)BLAQ_DLSYM("nvmlInit_v2");
+    if (!init_fn) init_fn =
+        (pfn_nvmlInit)BLAQ_DLSYM("nvmlInit");
+
+    pfn_nvmlShutdown shutdown_fn =
+        (pfn_nvmlShutdown)BLAQ_DLSYM("nvmlShutdown");
+
+    pfn_nvmlDeviceGetCount count_fn =
+        (pfn_nvmlDeviceGetCount)BLAQ_DLSYM("nvmlDeviceGetCount_v2");
+    if (!count_fn) count_fn =
+        (pfn_nvmlDeviceGetCount)BLAQ_DLSYM("nvmlDeviceGetCount");
+
+    pfn_nvmlDeviceGetHandleByIndex handle_fn =
+        (pfn_nvmlDeviceGetHandleByIndex)BLAQ_DLSYM("nvmlDeviceGetHandleByIndex_v2");
+    if (!handle_fn) handle_fn =
+        (pfn_nvmlDeviceGetHandleByIndex)BLAQ_DLSYM("nvmlDeviceGetHandleByIndex");
+
+    pfn_nvmlDeviceGetName           name_fn     = (pfn_nvmlDeviceGetName)          BLAQ_DLSYM("nvmlDeviceGetName");
+    pfn_nvmlDeviceGetMemoryInfo     meminfo_fn  = (pfn_nvmlDeviceGetMemoryInfo)     BLAQ_DLSYM("nvmlDeviceGetMemoryInfo");
+    pfn_nvmlDeviceGetMemoryBusWidth buswidth_fn = (pfn_nvmlDeviceGetMemoryBusWidth) BLAQ_DLSYM("nvmlDeviceGetMemoryBusWidth");
+    pfn_nvmlDeviceGetMaxClockInfo   maxclock_fn = (pfn_nvmlDeviceGetMaxClockInfo)   BLAQ_DLSYM("nvmlDeviceGetMaxClockInfo");
+
+#undef BLAQ_DLSYM
+
+    bool ok = false;
+    if (init_fn && count_fn && handle_fn && name_fn && meminfo_fn
+            && init_fn() == BLAQ_NVML_SUCCESS) {
+        unsigned int n = 0;
+        if (count_fn(&n) == BLAQ_NVML_SUCCESS && n > 0) {
+            blaq_nvml_device_t dev = nullptr;
+            if (handle_fn(0, &dev) == BLAQ_NVML_SUCCESS) {
+                name_fn(dev, out->name, sizeof(out->name));
+
+                blaq_nvml_memory_t mem = {};
+                if (meminfo_fn(dev, &mem) == BLAQ_NVML_SUCCESS)
+                    out->vram_bytes = mem.total;
+
+                if (buswidth_fn) buswidth_fn(dev, &out->bus_width_bits);
+                if (maxclock_fn) maxclock_fn(dev, BLAQ_NVML_CLOCK_MEM, &out->mem_clock_mhz);
+
+                if (out->bus_width_bits > 0 && out->mem_clock_mhz > 0) {
+                    // DDR: effective data rate = clock × 2
+                    out->peak_bw_bytes_per_sec =
+                        (double)(out->bus_width_bits / 8) *
+                        (double)out->mem_clock_mhz * 2.0 * 1e6;
+                }
+                out->valid = out->name[0] != '\0';
+                ok = out->valid;
+            }
+        }
+        if (shutdown_fn) shutdown_fn();
+    }
+
+#if defined(__linux__)
+    dlclose(lib);
+#elif defined(_WIN32)
+    FreeLibrary((HMODULE)lib);
+#endif
+
+    return ok;
+#endif // !__APPLE__
+}
+
+// ---------------------------------------------------------------------------
+// CUDA device-to-device STREAM benchmark (dynamically loaded)
+// ---------------------------------------------------------------------------
+//
+// Measures GPU memory bandwidth using cudaMemcpy device-to-device.
+// D2D copies perform one full read + one full write, so:
+//   measured_bw = 2 × size × passes / elapsed_s
+// This matches the "total bandwidth" convention used in NVIDIA spec sheets.
+//
+// Returns measured median BW in bytes/sec, or 0.0 if libcudart is unavailable.
+
+#define BLAQ_CUDA_SUCCESS    0
+#define BLAQ_CUDA_MEMCPY_D2D 3
+
+typedef int   blaq_cuda_err_t;
+typedef void *blaq_cuda_event_t;
+
+typedef blaq_cuda_err_t (*pfn_cudaMalloc)           (void **, size_t);
+typedef blaq_cuda_err_t (*pfn_cudaFree)             (void *);
+typedef blaq_cuda_err_t (*pfn_cudaMemset)           (void *, int, size_t);
+typedef blaq_cuda_err_t (*pfn_cudaMemcpy)           (void *, const void *, size_t, int);
+typedef blaq_cuda_err_t (*pfn_cudaEventCreate)      (blaq_cuda_event_t *);
+typedef blaq_cuda_err_t (*pfn_cudaEventDestroy)     (blaq_cuda_event_t);
+typedef blaq_cuda_err_t (*pfn_cudaEventRecord)      (blaq_cuda_event_t, void *);
+typedef blaq_cuda_err_t (*pfn_cudaEventSynchronize) (blaq_cuda_event_t);
+typedef blaq_cuda_err_t (*pfn_cudaEventElapsedTime) (float *, blaq_cuda_event_t, blaq_cuda_event_t);
+typedef blaq_cuda_err_t (*pfn_cudaDeviceSynchronize)(void);
+
+static double cuda_stream_benchmark(int n_runs, bw_stats_t * stats_out) {
+    if (stats_out) memset(stats_out, 0, sizeof(*stats_out));
+
+#if defined(__APPLE__)
+    return 0.0;
+#else
+#if defined(__linux__)
+    void * lib = dlopen("libcudart.so",    RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libcudart.so.11", RTLD_LAZY | RTLD_LOCAL);
+#elif defined(_WIN32)
+    void * lib = (void *)LoadLibraryA("cudart64_12.dll");
+    if (!lib) lib = (void *)LoadLibraryA("cudart64_11.dll");
+#else
+    void * lib = nullptr;
+#endif
+    if (!lib) return 0.0;
+
+#if defined(__linux__)
+#  define BLAQ_CUDA_SYM(n) dlsym(lib, n)
+#elif defined(_WIN32)
+#  define BLAQ_CUDA_SYM(n) (void *)GetProcAddress((HMODULE)lib, n)
+#else
+#  define BLAQ_CUDA_SYM(n) nullptr
+#endif
+
+    pfn_cudaMalloc            fn_malloc  = (pfn_cudaMalloc)           BLAQ_CUDA_SYM("cudaMalloc");
+    pfn_cudaFree              fn_free    = (pfn_cudaFree)             BLAQ_CUDA_SYM("cudaFree");
+    pfn_cudaMemset            fn_memset  = (pfn_cudaMemset)           BLAQ_CUDA_SYM("cudaMemset");
+    pfn_cudaMemcpy            fn_memcpy  = (pfn_cudaMemcpy)           BLAQ_CUDA_SYM("cudaMemcpy");
+    pfn_cudaEventCreate       fn_evcreate= (pfn_cudaEventCreate)      BLAQ_CUDA_SYM("cudaEventCreate");
+    pfn_cudaEventDestroy      fn_evdest  = (pfn_cudaEventDestroy)     BLAQ_CUDA_SYM("cudaEventDestroy");
+    pfn_cudaEventRecord       fn_evrec   = (pfn_cudaEventRecord)      BLAQ_CUDA_SYM("cudaEventRecord");
+    pfn_cudaEventSynchronize  fn_evsync  = (pfn_cudaEventSynchronize) BLAQ_CUDA_SYM("cudaEventSynchronize");
+    pfn_cudaEventElapsedTime  fn_elapsed = (pfn_cudaEventElapsedTime) BLAQ_CUDA_SYM("cudaEventElapsedTime");
+    pfn_cudaDeviceSynchronize fn_devsync = (pfn_cudaDeviceSynchronize)BLAQ_CUDA_SYM("cudaDeviceSynchronize");
+
+#undef BLAQ_CUDA_SYM
+
+    double result = 0.0;
+
+    if (fn_malloc && fn_free && fn_memset && fn_memcpy &&
+        fn_evcreate && fn_evdest && fn_evrec && fn_evsync && fn_elapsed) {
+
+        const size_t BUF_BYTES = 256ULL * 1024 * 1024;  // 256 MB >> L2 on all GPUs
+        void * d_src = nullptr;
+        void * d_dst = nullptr;
+
+        if (fn_malloc(&d_src, BUF_BYTES) == BLAQ_CUDA_SUCCESS &&
+            fn_malloc(&d_dst, BUF_BYTES) == BLAQ_CUDA_SUCCESS &&
+            fn_memset(d_src, 0x42, BUF_BYTES) == BLAQ_CUDA_SUCCESS) {
+
+            blaq_cuda_event_t ev_start = nullptr, ev_stop = nullptr;
+            fn_evcreate(&ev_start);
+            fn_evcreate(&ev_stop);
+
+            // Warmup — wakes up clocks and fills caches
+            fn_memcpy(d_dst, d_src, BUF_BYTES, BLAQ_CUDA_MEMCPY_D2D);
+            if (fn_devsync) fn_devsync();
+
+            // Timed passes — one event pair per pass for per-pass stats
+            std::vector<double> samples;
+            samples.reserve(n_runs);
+            for (int i = 0; i < n_runs; ++i) {
+                fn_evrec(ev_start, nullptr);
+                fn_memcpy(d_dst, d_src, BUF_BYTES, BLAQ_CUDA_MEMCPY_D2D);
+                fn_evrec(ev_stop, nullptr);
+                fn_evsync(ev_stop);
+                float ms = 0.f;
+                fn_elapsed(&ms, ev_start, ev_stop);
+                if (ms > 0.f) {
+                    // D2D = 1 read + 1 write = 2 × BUF_BYTES total traffic
+                    samples.push_back(2.0 * (double)BUF_BYTES / ((double)ms * 1e-3));
+                }
+            }
+
+            fn_evdest(ev_start);
+            fn_evdest(ev_stop);
+
+            if (!samples.empty()) {
+                std::vector<double> sorted = samples;
+                std::sort(sorted.begin(), sorted.end());
+                int n = (int)sorted.size();
+                double median = (n % 2 == 0)
+                    ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0
+                    : sorted[n/2];
+                double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+                double mean = sum / n;
+                double sq = 0.0;
+                for (double v : samples) sq += (v - mean) * (v - mean);
+                double stddev = (n > 1) ? sqrt(sq / (n - 1)) : 0.0;
+                float  cv     = (mean > 0.0) ? (float)(stddev / mean) : 0.f;
+                if (stats_out) { stats_out->median = median; stats_out->mean = mean;
+                                 stats_out->stddev = stddev; stats_out->cv   = cv; }
+                result = median;
+            }
+        }
+        if (d_src) fn_free(d_src);
+        if (d_dst) fn_free(d_dst);
+    }
+
+#if defined(__linux__)
+    dlclose(lib);
+#elif defined(_WIN32)
+    FreeLibrary((HMODULE)lib);
+#endif
+    return result;
+#endif // !__APPLE__
+}
+
+static void nvml_derive_vendor(const char * gpu_name, char * vendor, size_t vlen) {
+    if (strstr(gpu_name, "NVIDIA") || strstr(gpu_name, "GeForce") ||
+        strstr(gpu_name, "Quadro") || strstr(gpu_name, "Tesla")   ||
+        strstr(gpu_name, "RTX")    || strstr(gpu_name, "GTX"))
+        snprintf(vendor, vlen, "NVIDIA");
+    else if (strstr(gpu_name, "AMD") || strstr(gpu_name, "Radeon"))
+        snprintf(vendor, vlen, "AMD");
+    else if (strstr(gpu_name, "Intel") || strstr(gpu_name, "Arc"))
+        snprintf(vendor, vlen, "Intel");
+    else
+        snprintf(vendor, vlen, "GPU");
+}
+
+// ---------------------------------------------------------------------------
 // Hardware identification helpers
 // ---------------------------------------------------------------------------
 
@@ -387,78 +675,154 @@ bool blaq_profile_measure(blaq_profile_t * out, float gamma, float beta,
                           float sigma_override,
                           int n_runs, float warmup_s, float measure_s) {
     if (!out) return false;
-    if (n_runs < 1)   n_runs   = 1;
+    if (n_runs < 1)       n_runs    = 1;
     if (measure_s <= 0.f) measure_s = 0.5f;
     if (warmup_s  <  0.f) warmup_s  = 0.f;
 
-    // Step 1
+    memset(out, 0, sizeof(*out));
+
+    // Step 1: cache-line size
     out->cache_line_bytes = detect_cache_line_bytes();
 
-    // Step 2: peak single-agent bandwidth
-    fprintf(stderr, "  Measuring peak BW (%d pass%s × %.1f s, %.1f s warmup) ...\n",
-            n_runs, n_runs == 1 ? "" : "es", (double)measure_s, (double)warmup_s);
-    bw_stats_t peak = stream_benchmark_stats(1, warmup_s, measure_s, n_runs);
-    out->peak_bw_bytes_per_sec = peak.median;
-    out->peak_bw_cv            = peak.cv;
+    // Step 2: detect inference device and measure peak BW
+    //   - NVIDIA GPU: query via NVML (theoretical DDR formula, no benchmark needed)
+    //   - Apple UMA:  CPU STREAM benchmark == GPU BW (same physical DRAM)
+    //   - CPU-only:   CPU STREAM benchmark
 
-    // Step 3
-    out->shared_bus_procs = count_shared_bus_processors();
+#if !defined(__APPLE__)
+    blaq_nvml_gpu_t nvml_gpu = {};
+    bool gpu_found = nvml_query_first_gpu(&nvml_gpu);
+#else
+    bool gpu_found = false;
+#endif
 
-    // Step 4: contention bandwidth
-    if (sigma_override >= 0.f) {
-        out->obs_bw_bytes_per_sec =
-            out->peak_bw_bytes_per_sec * (1.0 - (double)sigma_override);
-        out->obs_bw_cv = 0.f;
+    if (gpu_found) {
+        // --- Discrete GPU path ---
+        nvml_derive_vendor(nvml_gpu.name, out->hw_vendor, sizeof(out->hw_vendor));
+
+        // Strip vendor prefix ("NVIDIA GeForce RTX …" → "GeForce RTX …")
+        const char * chip = nvml_gpu.name;
+        size_t vl = strlen(out->hw_vendor);
+        if (BLAQ_STRNCASECMP(chip, out->hw_vendor, vl) == 0 && chip[vl] == ' ')
+            chip += vl + 1;
+        snprintf(out->hw_chip, sizeof(out->hw_chip), "%s", chip);
+
+        out->hw_memory_gb = (uint32_t)(nvml_gpu.vram_bytes / (1024ULL * 1024 * 1024));
+        snprintf(out->hw_type, sizeof(out->hw_type), "gpu");
+
+        fprintf(stderr, "  GPU detected: %s  (%u GB VRAM)\n",
+                nvml_gpu.name, out->hw_memory_gb);
+        fprintf(stderr, "  Measuring GPU BW (%d pass%s, cudaMemcpy D2D + 1 warmup) ...\n",
+                n_runs, n_runs == 1 ? "" : "es");
+
+        bw_stats_t cuda_stats = {};
+        double cuda_bw = cuda_stream_benchmark(n_runs, &cuda_stats);
+
+        if (cuda_bw > 0.0) {
+            out->peak_bw_bytes_per_sec = cuda_stats.median;
+            out->peak_bw_cv            = cuda_stats.cv;
+            out->n_runs                = (uint32_t)n_runs;
+            snprintf(out->bw_source, sizeof(out->bw_source), "cuda-stream-median");
+            fprintf(stderr, "  Peak BW: %.1f GB/s  (CUDA D2D median of %d runs, CV=%.3f)\n",
+                    cuda_bw / 1e9, n_runs, (double)cuda_stats.cv);
+        } else if (nvml_gpu.peak_bw_bytes_per_sec > 0.0) {
+            // CUDA runtime unavailable — fall back to NVML theoretical
+            fprintf(stderr,
+                "  WARNING: libcudart not found — using NVML theoretical BW as fallback.\n"
+                "  Peak BW: %.1f GB/s  (NVML: %u-bit × %u MHz DDR)\n",
+                nvml_gpu.peak_bw_bytes_per_sec / 1e9,
+                nvml_gpu.bus_width_bits, nvml_gpu.mem_clock_mhz);
+            out->peak_bw_bytes_per_sec = nvml_gpu.peak_bw_bytes_per_sec;
+            out->peak_bw_cv            = 0.f;
+            out->n_runs                = 0;
+            snprintf(out->bw_source, sizeof(out->bw_source), "nvml-theoretical");
+        } else {
+            fprintf(stderr, "  WARNING: Could not measure GPU BW (no CUDA, no NVML clock info).\n");
+            out->peak_bw_bytes_per_sec = 0.0;
+            out->n_runs                = 0;
+            snprintf(out->bw_source, sizeof(out->bw_source), "unknown");
+        }
+
+        // Contention: discrete GPU VRAM is not shared with the CPU bus.
+        // sigma=0 unless the user overrides (e.g. for a true UMA discrete GPU).
+        if (sigma_override >= 0.f) {
+            out->contention_ratio     = sigma_override;
+            out->obs_bw_bytes_per_sec = out->peak_bw_bytes_per_sec * (1.0 - sigma_override);
+            out->obs_bw_cv            = 0.f;
+        } else {
+            out->contention_ratio     = 0.f;
+            out->obs_bw_bytes_per_sec = out->peak_bw_bytes_per_sec;
+            out->obs_bw_cv            = 0.f;
+            fprintf(stderr,
+                "  Discrete GPU: separate VRAM bus → sigma=0.0 (no CPU/GPU contention).\n"
+                "  Use --sigma <value> if your GPU shares a memory bus with the CPU.\n\n");
+        }
+
+        out->shared_bus_procs = 1;  // GPU VRAM bus is private to the GPU
+
     } else {
-        fprintf(stderr, "  Measuring contention BW (%d pass%s × %.1f s, %.1f s warmup) ...\n",
+        // --- CPU / Apple UMA path ---
+        detect_hw_vendor_chip(out->hw_vendor, sizeof(out->hw_vendor),
+                              out->hw_chip,   sizeof(out->hw_chip));
+        out->hw_memory_gb = detect_hw_memory_gb();
+#if defined(__APPLE__)
+        snprintf(out->hw_type, sizeof(out->hw_type), "uma");
+#else
+        snprintf(out->hw_type, sizeof(out->hw_type), "cpu");
+#endif
+        snprintf(out->bw_source, sizeof(out->bw_source), "stream-median");
+
+        // Step 2: peak single-agent BW
+        fprintf(stderr, "  Measuring peak BW (%d pass%s × %.1f s, %.1f s warmup) ...\n",
                 n_runs, n_runs == 1 ? "" : "es", (double)measure_s, (double)warmup_s);
-        bw_stats_t obs = stream_benchmark_stats((int)out->shared_bus_procs,
-                                                warmup_s, measure_s, n_runs);
-        out->obs_bw_bytes_per_sec = obs.median;
-        out->obs_bw_cv            = obs.cv;
+        bw_stats_t peak = stream_benchmark_stats(1, warmup_s, measure_s, n_runs);
+        out->peak_bw_bytes_per_sec = peak.median;
+        out->peak_bw_cv            = peak.cv;
+        out->n_runs                = (uint32_t)n_runs;
+
+        // Step 3: shared-bus processor count
+        out->shared_bus_procs = count_shared_bus_processors();
+
+        // Step 4: contention BW
+        if (sigma_override >= 0.f) {
+            out->obs_bw_bytes_per_sec = out->peak_bw_bytes_per_sec * (1.0 - sigma_override);
+            out->obs_bw_cv            = 0.f;
+        } else {
+            fprintf(stderr, "  Measuring contention BW (%d pass%s × %.1f s, %.1f s warmup) ...\n",
+                    n_runs, n_runs == 1 ? "" : "es", (double)measure_s, (double)warmup_s);
+            bw_stats_t obs = stream_benchmark_stats((int)out->shared_bus_procs,
+                                                    warmup_s, measure_s, n_runs);
+            out->obs_bw_bytes_per_sec = obs.median;
+            out->obs_bw_cv            = obs.cv;
+        }
+
+        // Contention ratio
+        if (sigma_override >= 0.f) {
+            out->contention_ratio = sigma_override;
+        } else if (out->peak_bw_bytes_per_sec > 0.0) {
+            out->contention_ratio =
+                (float)(1.0 - out->obs_bw_bytes_per_sec / out->peak_bw_bytes_per_sec);
+        }
+        if (out->contention_ratio < 0.f) out->contention_ratio = 0.f;
+        if (out->contention_ratio > 1.f) out->contention_ratio = 1.f;
+
+        if (gpu_present_on_shared_bus() && out->shared_bus_procs == 1
+                && sigma_override < 0.f) {
+            fprintf(stderr,
+                "\nWARNING: GPU detected but contention was measured with CPU threads only.\n"
+                "         On NVLink-C2C systems (e.g. GB10) the GPU-HBM bus is independent\n"
+                "         of CPU LPDDR, so sigma=%.3f may be inaccurate.\n"
+                "         Use --sigma <value> to supply a known contention ratio.\n\n",
+                (double)out->contention_ratio);
+        }
     }
 
-    // Step 5: contention ratio
-    if (sigma_override >= 0.f) {
-        out->contention_ratio = sigma_override;
-    } else if (out->peak_bw_bytes_per_sec > 0.0) {
-        out->contention_ratio =
-            (float)(1.0 - out->obs_bw_bytes_per_sec / out->peak_bw_bytes_per_sec);
-    } else {
-        out->contention_ratio = 0.f;
-    }
-    if (out->contention_ratio < 0.f) out->contention_ratio = 0.f;
-    if (out->contention_ratio > 1.f) out->contention_ratio = 1.f;
-
-    if (gpu_present_on_shared_bus() && out->shared_bus_procs == 1
-            && sigma_override < 0.f) {
-        fprintf(stderr,
-            "\nWARNING: GPU detected but contention ratio (sigma) was measured\n"
-            "         using CPU threads only.  On discrete-GPU or NVLink-C2C\n"
-            "         systems (e.g. Grace-Blackwell GB10) the GPU-HBM bus is\n"
-            "         independent of CPU LPDDR, so sigma=%.3f may be inaccurate.\n"
-            "         Use --sigma <value> to supply a known contention ratio.\n"
-            "         Typical values: 0.10-0.25 for shared-BW systems.\n\n",
-            (double)out->contention_ratio);
-    }
-
-    // Step 6: aligned group sizes for b=4
-    out->aligned_group_128 = 2 * out->cache_line_bytes;
-    out->aligned_group_256 = 4 * out->cache_line_bytes;
-
-    // Step 7: penalty weights
+    // Step 6: penalty weights
     out->lambda_bw  = (out->peak_bw_bytes_per_sec > 0.0)
         ? (float)(gamma / out->peak_bw_bytes_per_sec) : 0.f;
     out->lambda_mem = beta * out->contention_ratio;
 
-    // Hardware identification
-    detect_hw_vendor_chip(out->hw_vendor, sizeof(out->hw_vendor),
-                          out->hw_chip,   sizeof(out->hw_chip));
     detect_os_string(out->hw_os, sizeof(out->hw_os));
-    out->hw_memory_gb = detect_hw_memory_gb();
-
-    // Measurement metadata
-    out->n_runs    = (uint32_t)n_runs;
     get_timestamp(out->timestamp, sizeof(out->timestamp));
 
     return true;
@@ -476,8 +840,6 @@ void blaq_profile_defaults(blaq_profile_t * out) {
     out->obs_bw_bytes_per_sec  = 80.0  * 1e9;
     out->contention_ratio      = 0.20f;
     out->shared_bus_procs      = 2;
-    out->aligned_group_128     = 128;
-    out->aligned_group_256     = 256;
     out->lambda_bw             = (float)(1.0 / out->peak_bw_bytes_per_sec);
     out->lambda_mem            = 1.0f * out->contention_ratio;
     out->n_runs                = 0;
@@ -486,7 +848,9 @@ void blaq_profile_defaults(blaq_profile_t * out) {
     snprintf(out->hw_vendor,  sizeof(out->hw_vendor),  "Unknown");
     snprintf(out->hw_chip,    sizeof(out->hw_chip),    "Unknown");
     snprintf(out->hw_os,      sizeof(out->hw_os),      "Unknown");
-    snprintf(out->timestamp,  sizeof(out->timestamp),  "defaults");
+    snprintf(out->hw_type,   sizeof(out->hw_type),   "cpu");
+    snprintf(out->bw_source, sizeof(out->bw_source), "defaults");
+    snprintf(out->timestamp, sizeof(out->timestamp), "defaults");
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +879,12 @@ char * blaq_profile_suggest_filename(const blaq_profile_t * p, char * buf, size_
     char chip[128] = "unknown";
     size_t ci = 0;
     for (size_t i = 0; chip_src[i] && ci < sizeof(chip) - 1; i++) {
+        // Skip trademark/registered symbols: (R), (TM), (r), (tm)
+        if (chip_src[i] == '(') {
+            size_t j = i + 1;
+            while (chip_src[j] && chip_src[j] != ')') j++;
+            if (chip_src[j] == ')') { i = j; continue; }
+        }
         char c = chip_src[i];
         if (c == ' ' || c == '_') {
             c = '-';
@@ -531,10 +901,11 @@ char * blaq_profile_suggest_filename(const blaq_profile_t * p, char * buf, size_
     while (ci > 0 && chip[ci-1] == '-') ci--;
     chip[ci] = '\0';
 
+    const char * type = p->hw_type[0] ? p->hw_type : "cpu";
     if (p->hw_memory_gb > 0) {
-        snprintf(buf, len, "blaq-prof_%s_%s_%ugb.json", vendor, chip, p->hw_memory_gb);
+        snprintf(buf, len, "blaq_profile_%s_%s_%s_%ugb.json", type, vendor, chip, p->hw_memory_gb);
     } else {
-        snprintf(buf, len, "blaq-prof_%s_%s.json", vendor, chip);
+        snprintf(buf, len, "blaq_profile_%s_%s_%s.json", type, vendor, chip);
     }
     return buf;
 }
@@ -546,29 +917,29 @@ char * blaq_profile_suggest_filename(const blaq_profile_t * p, char * buf, size_
 bool blaq_profile_save_json(const blaq_profile_t * p, const char * path) {
     if (!p || !path) return false;
 
-    json j;
-    // Hardware identity first — makes the file self-descriptive at the top
+    nlohmann::ordered_json j;
+    // Inference device identity
     j["hw_vendor"]             = p->hw_vendor;
     j["hw_chip"]               = p->hw_chip;
     j["hw_os"]                 = p->hw_os;
     j["hw_memory_gb"]          = p->hw_memory_gb;
+    j["hw_type"]               = p->hw_type;
     j["timestamp"]             = p->timestamp;
 
-    // Core BLAQ parameters
+    // Measurement metadata
+    j["bw_source"]             = p->bw_source;
+    j["n_runs"]                = p->n_runs;
+    j["peak_bw_cv"]            = p->peak_bw_cv;
+    j["obs_bw_cv"]             = p->obs_bw_cv;
+
+    // BLAQ parameters
     j["cache_line_bytes"]      = p->cache_line_bytes;
     j["peak_bw_bytes_per_sec"] = p->peak_bw_bytes_per_sec;
     j["obs_bw_bytes_per_sec"]  = p->obs_bw_bytes_per_sec;
     j["contention_ratio"]      = p->contention_ratio;
     j["shared_bus_procs"]      = p->shared_bus_procs;
-    j["aligned_group_128"]     = p->aligned_group_128;
-    j["aligned_group_256"]     = p->aligned_group_256;
     j["lambda_bw"]             = p->lambda_bw;
     j["lambda_mem"]            = p->lambda_mem;
-
-    // Measurement statistics
-    j["n_runs"]                = p->n_runs;
-    j["peak_bw_cv"]            = p->peak_bw_cv;
-    j["obs_bw_cv"]             = p->obs_bw_cv;
 
     std::ofstream ofs(path);
     if (!ofs) return false;
@@ -636,28 +1007,28 @@ bool blaq_profile_load_json(blaq_profile_t * out, const char * path) {
         }
     };
 
-    // Required: hardware identity
-    if (!req_str("hw_vendor",           out->hw_vendor,  sizeof(out->hw_vendor)))  return false;
-    if (!req_str("hw_chip",             out->hw_chip,    sizeof(out->hw_chip)))    return false;
+    // Required: inference device identity
+    if (!req_str("hw_vendor",             out->hw_vendor,  sizeof(out->hw_vendor)))  return false;
+    if (!req_str("hw_chip",               out->hw_chip,    sizeof(out->hw_chip)))    return false;
+    if (!req_str("hw_type",               out->hw_type,    sizeof(out->hw_type)))    return false;
 
     // Required: core BLAQ parameters
-    if (!req_u32("cache_line_bytes",    out->cache_line_bytes))       return false;
-    if (!req_dbl("peak_bw_bytes_per_sec", out->peak_bw_bytes_per_sec)) return false;
-    if (!req_dbl("obs_bw_bytes_per_sec",  out->obs_bw_bytes_per_sec))  return false;
-    if (!req_flt("contention_ratio",    out->contention_ratio))       return false;
-    if (!req_u32("shared_bus_procs",    out->shared_bus_procs))       return false;
-    if (!req_u32("aligned_group_128",   out->aligned_group_128))      return false;
-    if (!req_u32("aligned_group_256",   out->aligned_group_256))      return false;
-    if (!req_flt("lambda_bw",           out->lambda_bw))              return false;
-    if (!req_flt("lambda_mem",          out->lambda_mem))             return false;
+    if (!req_u32("cache_line_bytes",      out->cache_line_bytes))        return false;
+    if (!req_dbl("peak_bw_bytes_per_sec", out->peak_bw_bytes_per_sec))   return false;
+    if (!req_dbl("obs_bw_bytes_per_sec",  out->obs_bw_bytes_per_sec))    return false;
+    if (!req_flt("contention_ratio",      out->contention_ratio))        return false;
+    if (!req_u32("shared_bus_procs",      out->shared_bus_procs))        return false;
+    if (!req_flt("lambda_bw",             out->lambda_bw))               return false;
+    if (!req_flt("lambda_mem",            out->lambda_mem))              return false;
 
-    // Optional: supplementary identity and measurement stats
-    opt_str("hw_os",       out->hw_os,      sizeof(out->hw_os));
+    // Optional: supplementary fields
+    opt_str("hw_os",        out->hw_os,        sizeof(out->hw_os));
     opt_u32("hw_memory_gb", out->hw_memory_gb);
-    opt_str("timestamp",   out->timestamp,  sizeof(out->timestamp));
-    opt_u32("n_runs",      out->n_runs);
-    opt_flt("peak_bw_cv",  out->peak_bw_cv);
-    opt_flt("obs_bw_cv",   out->obs_bw_cv);
+    opt_str("bw_source",    out->bw_source,    sizeof(out->bw_source));
+    opt_str("timestamp",    out->timestamp,    sizeof(out->timestamp));
+    opt_u32("n_runs",       out->n_runs);
+    opt_flt("peak_bw_cv",   out->peak_bw_cv);
+    opt_flt("obs_bw_cv",    out->obs_bw_cv);
 
     return true;
 }
@@ -670,57 +1041,56 @@ void blaq_profile_print(const blaq_profile_t * p) {
     if (!p) return;
     fprintf(stderr, "\n=== BLAQ Hardware Profile ===\n");
 
-    // Hardware identity
+    // Infer device kind label from hw_type
+    const bool is_gpu = (strncmp(p->hw_type, "gpu", 3) == 0);
+    const bool is_uma = (strncmp(p->hw_type, "uma", 3) == 0);
+    const char * kind = is_gpu ? "discrete GPU" : (is_uma ? "unified memory" : "CPU");
+
     if (p->hw_chip[0]) {
-        fprintf(stderr, "  Device                : %s %s\n",
+        fprintf(stderr, "  Inference device      : %s%s%s  [%s]\n",
                 p->hw_vendor[0] ? p->hw_vendor : "",
-                p->hw_chip);
+                p->hw_vendor[0] ? " " : "",
+                p->hw_chip, kind);
     }
-    if (p->hw_os[0]) {
-        fprintf(stderr, "  OS                    : %s\n", p->hw_os);
-    }
+    const char * mem_label = is_gpu ? "VRAM" : "Memory";
     if (p->hw_memory_gb > 0) {
-        fprintf(stderr, "  Memory                : %u GB\n", p->hw_memory_gb);
+        fprintf(stderr, "  %-22s: %u GB\n", mem_label, p->hw_memory_gb);
     }
-    if (p->timestamp[0]) {
-        fprintf(stderr, "  Measured              : %s\n", p->timestamp);
-    }
+    if (p->hw_os[0])    fprintf(stderr, "  OS                    : %s\n", p->hw_os);
+    if (p->timestamp[0]) fprintf(stderr, "  Measured              : %s\n", p->timestamp);
     fprintf(stderr, "\n");
 
-    // Bandwidth measurements
-    fprintf(stderr, "  Cache-line size       : %u bytes\n",  p->cache_line_bytes);
+    // Bandwidth
+    fprintf(stderr, "  Cache-line size       : %u bytes\n", p->cache_line_bytes);
 
-    if (p->n_runs > 0) {
+    const bool bw_measured = (p->n_runs > 0);
+    const bool bw_nvml     = (strcmp(p->bw_source, "nvml-theoretical") == 0);
+    const char * bw_tag    = bw_nvml ? "NVML theoretical" : p->bw_source;
+
+    if (bw_measured) {
         fprintf(stderr, "  Peak BW               : %.1f GB/s  (median of %u runs, CV=%.3f%s)\n",
                 p->peak_bw_bytes_per_sec / 1e9, p->n_runs, (double)p->peak_bw_cv,
-                p->peak_bw_cv > 0.05f ? " ⚠ high variance" : "");
+                p->peak_bw_cv > 0.05f ? "  WARNING: high variance" : "");
     } else {
-        fprintf(stderr, "  Peak BW               : %.1f GB/s\n",
-                p->peak_bw_bytes_per_sec / 1e9);
+        fprintf(stderr, "  Peak BW               : %.1f GB/s  (%s)\n",
+                p->peak_bw_bytes_per_sec / 1e9, bw_tag[0] ? bw_tag : "source unknown");
     }
 
-    if (p->n_runs > 0) {
+    if (is_gpu && p->contention_ratio < 0.005f) {
+        fprintf(stderr, "  Contention BW         : %.1f GB/s  (sigma=0, discrete GPU)\n",
+                p->obs_bw_bytes_per_sec / 1e9);
+    } else if (bw_measured) {
         fprintf(stderr, "  Contention BW         : %.1f GB/s  (median of %u runs, CV=%.3f%s)\n",
                 p->obs_bw_bytes_per_sec / 1e9, p->n_runs, (double)p->obs_bw_cv,
-                p->obs_bw_cv > 0.05f ? " ⚠ high variance" : "");
+                p->obs_bw_cv > 0.05f ? "  WARNING: high variance" : "");
     } else {
         fprintf(stderr, "  Contention BW         : %.1f GB/s\n",
                 p->obs_bw_bytes_per_sec / 1e9);
     }
 
-    const bool gpu_present = gpu_present_on_shared_bus();
-    const bool sigma_zero  = (p->contention_ratio < 0.005f);
-    fprintf(stderr, "  Contention ratio (σ)  : %.3f%s\n",
-            (double)p->contention_ratio,
-            (gpu_present && sigma_zero) ? "  [GPU present — CPU-only measurement]" : "");
-
-    fprintf(stderr, "  Shared-bus procs      : %u%s\n",
-            p->shared_bus_procs,
-            gpu_present ? "  (CPU only; GPU not included)" : "");
-    fprintf(stderr, "  Aligned group (4-bit) : %u weights  (%u-byte cache line)\n",
-            p->aligned_group_128, p->cache_line_bytes);
-    fprintf(stderr, "  Double-line group     : %u weights\n", p->aligned_group_256);
-    fprintf(stderr, "  lambda_bw             : %.3e\n",   (double)p->lambda_bw);
-    fprintf(stderr, "  lambda_mem            : %.3f\n",   (double)p->lambda_mem);
+    fprintf(stderr, "  Contention ratio (σ)  : %.3f\n", (double)p->contention_ratio);
+    fprintf(stderr, "  Shared-bus procs      : %u\n",   p->shared_bus_procs);
+    fprintf(stderr, "  lambda_bw             : %.3e\n", (double)p->lambda_bw);
+    fprintf(stderr, "  lambda_mem            : %.3f\n", (double)p->lambda_mem);
     fprintf(stderr, "==============================\n\n");
 }

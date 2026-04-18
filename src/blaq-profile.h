@@ -21,28 +21,28 @@ extern "C" {
 
 typedef struct blaq_profile {
     // --- hardware geometry ---
-    uint32_t cache_line_bytes;       // L:          cache-line size in bytes (e.g. 64 or 128)
-    double   peak_bw_bytes_per_sec;  // BW_peak:    median single-agent sequential read bandwidth
-    double   obs_bw_bytes_per_sec;   // BW_obs:     median bandwidth under contention
-    float    contention_ratio;       // sigma:      1 - BW_obs / BW_peak  in [0, 1]
-    uint32_t shared_bus_procs;       // P_count:    number of processors sharing the bus
-
-    // --- derived alignment ---
-    uint32_t aligned_group_128;      // s*(b=4, L):   = 8*L/4  (cache-aligned block size at 4-bit)
-    uint32_t aligned_group_256;      // 2 * aligned_group_128 (double-line variant)
+    uint32_t cache_line_bytes;       // L:       cache-line size in bytes (e.g. 64 or 128)
+    double   peak_bw_bytes_per_sec;  // BW_peak: GPU BW (NVML) or CPU STREAM median
+    double   obs_bw_bytes_per_sec;   // BW_obs:  bandwidth under contention
+    float    contention_ratio;       // sigma:   1 - BW_obs / BW_peak  in [0, 1]
+    uint32_t shared_bus_procs;       // P_count: number of processors sharing the bus
 
     // --- penalty weights ---
     float    lambda_bw;              // gamma / BW_peak
     float    lambda_mem;             // beta  * sigma
 
-    // --- hardware identification (auto-detected) ---
-    char     hw_vendor[64];          // e.g. "Apple", "NVIDIA", "Intel", "ARM"
-    char     hw_chip[128];           // e.g. "M1", "M2 Pro", "Grace-Blackwell GB10"
-    char     hw_os[64];              // e.g. "macOS 15.4", "Ubuntu 22.04 LTS"
-    uint32_t hw_memory_gb;           // total system memory in GB
+    // --- inference device (GPU when available, CPU on UMA/CPU-only systems) ---
+    char     hw_vendor[64];          // e.g. "NVIDIA", "Apple", "Intel", "AMD"
+    char     hw_chip[128];           // e.g. "GeForce RTX 3070 Ti", "M1", "Core i7-12800H"
+    char     hw_os[64];              // e.g. "Ubuntu 24.04 LTS", "macOS 15.4"
+    uint32_t hw_memory_gb;           // VRAM if GPU, system RAM if UMA/CPU
+    char     hw_type[16];            // "gpu" | "uma" | "cpu"
+
+    // --- bandwidth metadata ---
+    char     bw_source[32];          // "nvml-theoretical" | "stream-median" | "user-supplied"
 
     // --- measurement statistics ---
-    uint32_t n_runs;                 // number of timed passes used per measurement
+    uint32_t n_runs;                 // timed passes per BW direction (0 = theoretical/defaults)
     float    peak_bw_cv;             // CV = stddev/mean across n_runs passes for peak BW
     float    obs_bw_cv;              // CV = stddev/mean across n_runs passes for contention BW
     char     timestamp[32];          // ISO 8601 timestamp of when the profile was generated
@@ -95,9 +95,10 @@ void blaq_profile_defaults(blaq_profile_t * out);
 
 //
 // Auto-generate a self-descriptive filename for this profile.
-// Format: blaq-prof_<vendor>_<chip>_<ram>gb.json
-// Example: blaq-prof_apple_m1_8gb.json
-//          blaq-prof_nvidia_gh100_128gb.json
+// Format: blaq_profile_<type>_<vendor>_<chip>_<ram>gb.json
+// Example: blaq_profile_uma_apple_m1_8gb.json
+//          blaq_profile_gpu_nvidia_gh100_128gb.json
+//          blaq_profile_cpu_intel_core-i9_32gb.json
 //
 // buf:  output buffer
 // len:  buffer length (recommend >= 128)
