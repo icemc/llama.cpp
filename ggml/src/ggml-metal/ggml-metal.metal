@@ -153,39 +153,47 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
 }
 
 // BLAQ_Q4_128: 128-weight block, one 64-byte cache line of weights.
-// The dequantize_t4 function decodes 4 weights at a time.
-// il: 0..31  →  il/16 selects low(0) or high(1) nibble half,
-//              il%16 selects which pair of uint16 to read.
+// Group-of-8 packing: byte[4g+k] lo=w_{8g+k}, hi=w_{8g+k+4}.
+// As uint16: uint16[2g+i] = byte[4g+2i] | (byte[4g+2i+1]<<8)
+//   bits  0- 3: w_{8g+2i}    (lo nibble of even byte)
+//   bits  4- 7: w_{8g+2i+4}  (hi nibble of even byte)
+//   bits  8-11: w_{8g+2i+1}  (lo nibble of odd byte)
+//   bits 12-15: w_{8g+2i+5}  (hi nibble of odd byte)
+// il: 0..31, sequential: il=k → weights [4k..4k+3].
+//   il%2==0: lo nibbles (w_{8*(il/2)+0..3}), mask 0x000F / 0x0F00
+//   il%2==1: hi nibbles (w_{8*(il/2)+4..7}), mask 0x00F0 / 0xF000
 template <typename type4>
 void dequantize_blaq_q4_128_t4(device const block_blaq_q4_128 * xb, short il, thread type4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
-    const float d1 = (il/16) ? (xb->d / 16.h) : xb->d;
+    // Even il: lo nibbles (bits 0-3, 8-11); odd il: hi nibbles (bits 4-7, 12-15).
+    const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
-    const ushort mask0 = (il/16) ? 0x00F0 : 0x000F;
+    const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
 
     for (int i = 0; i < 2; i++) {
-        reg[2*i + 0] = d1 * (qs[2*(il%16) + i] & mask0) + md;
-        reg[2*i + 1] = d2 * (qs[2*(il%16) + i] & mask1) + md;
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
     }
 }
 
 // BLAQ_Q4_256: 256-weight block, one 128-byte cache line of weights.
-// il: 0..63  →  il/32 selects low(0) or high(1) nibble half,
-//              il%32 selects which pair of uint16 to read.
+// Same group-of-8 packing as BLAQ_Q4_128.
+// il: 0..63, sequential: il=k → weights [4k..4k+3].
+//   il%2==0: lo nibbles, il%2==1: hi nibbles, group g = il/2.
 template <typename type4>
 void dequantize_blaq_q4_256_t4(device const block_blaq_q4_256 * xb, short il, thread type4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
-    const float d1 = (il/32) ? (xb->d / 16.h) : xb->d;
+    const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
-    const ushort mask0 = (il/32) ? 0x00F0 : 0x000F;
+    const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
 
     for (int i = 0; i < 2; i++) {
-        reg[2*i + 0] = d1 * (qs[2*(il%32) + i] & mask0) + md;
-        reg[2*i + 1] = d2 * (qs[2*(il%32) + i] & mask1) + md;
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
     }
 }
 
@@ -3579,11 +3587,16 @@ void kernel_mul_mv_blaq_q4_128_f32_impl(
             device const uint8_t * qs = ax[row][ib].qs + il*8;
             const float d = ax[row][ib].d;
 
+            // Group-of-8 packing: bytes [0..3] lo=[w0..w3] hi=[w4..w7],
+            //                      bytes [4..7] lo=[w8..w11] hi=[w12..w15].
+            // yl[0..15] = activations [il*16 .. il*16+15].
             float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < 8; ++i) {
-                const float w0 = (float)((int)(qs[i] & 0x0F) - 8);
-                const float w1 = (float)((int)(qs[i] >>  4) - 8);
-                sumq += w0*yl[2*i] + w1*yl[2*i+1];
+            FOR_UNROLL (short g = 0; g < 2; ++g) {
+                FOR_UNROLL (short k = 0; k < 4; ++k) {
+                    const float w0 = (float)((int)(qs[4*g + k] & 0x0F) - 8);
+                    const float w1 = (float)((int)(qs[4*g + k] >>  4)  - 8);
+                    sumq += w0 * yl[8*g + k] + w1 * yl[8*g + k + 4];
+                }
             }
             sumf[row] += sumq * d;
         }
@@ -3663,11 +3676,15 @@ void kernel_mul_mv_blaq_q4_256_f32_impl(
             device const uint8_t * qs = ax[row][ib].qs + il*8;
             const float d = ax[row][ib].d;
 
+            // Group-of-8 packing: bytes [0..3] lo=[w0..w3] hi=[w4..w7],
+            //                      bytes [4..7] lo=[w8..w11] hi=[w12..w15].
             float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < 8; ++i) {
-                const float w0 = (float)((int)(qs[i] & 0x0F) - 8);
-                const float w1 = (float)((int)(qs[i] >>  4) - 8);
-                sumq += w0*yl[2*i] + w1*yl[2*i+1];
+            FOR_UNROLL (short g = 0; g < 2; ++g) {
+                FOR_UNROLL (short k = 0; k < 4; ++k) {
+                    const float w0 = (float)((int)(qs[4*g + k] & 0x0F) - 8);
+                    const float w1 = (float)((int)(qs[4*g + k] >>  4)  - 8);
+                    sumq += w0 * yl[8*g + k] + w1 * yl[8*g + k + 4];
+                }
             }
             sumf[row] += sumq * d;
         }
@@ -3979,17 +3996,19 @@ template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_3")]]  kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_mxfp4,  32, dequantize_mxfp4_t4>;
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_mxfp4,  32, dequantize_mxfp4_t4>;
 
-// BLAQ_Q4_128: chpb = 128/4 = 32 chunks per block
-template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_128, 32, dequantize_blaq_q4_128_t4>;
+// BLAQ_Q4_128: epb=128 → chpb = 128/4 = 32 chunks per block
+// dequantize_blaq_q4_128_t4 uses il%2 (even=lo, odd=hi), il ranges 0..31; chpb=32 is required.
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_128, 128, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_128, 128, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_128, 128, dequantize_blaq_q4_128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_128_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_128, 128, dequantize_blaq_q4_128_t4>;
 
-// BLAQ_Q4_256: chpb = 256/4 = 64 chunks per block
-template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
-template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_256, 64, dequantize_blaq_q4_256_t4>;
+// BLAQ_Q4_256: epb=256 → chpb = 256/4 = 64 chunks per block
+// dequantize_blaq_q4_256_t4 uses il%2 (even=lo, odd=hi), il ranges 0..63; chpb=64 is required.
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
 
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
