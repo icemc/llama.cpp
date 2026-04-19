@@ -164,17 +164,17 @@ void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & r
 //   il%2==1: hi nibbles (w_{8*(il/2)+4..7}), mask 0x00F0 / 0xF000
 template <typename type4>
 void dequantize_blaq_q4_128_t4(device const block_blaq_q4_128 * xb, short il, thread type4 & reg) {
-    device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
+    device const uint16_t * qs = ((device const uint16_t *)xb + 2); // skip fp16 d and m (4 bytes)
     // Even il: lo nibbles (bits 0-3, 8-11); odd il: hi nibbles (bits 4-7, 12-15).
     const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
     const float d2 = d1 / 256.f;
-    const float md = -8.h * xb->d;
+    const float m  = (float)xb->m;
     const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
 
     for (int i = 0; i < 2; i++) {
-        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
-        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + m;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + m;
     }
 }
 
@@ -184,16 +184,16 @@ void dequantize_blaq_q4_128_t4(device const block_blaq_q4_128 * xb, short il, th
 //   il%2==0: lo nibbles, il%2==1: hi nibbles, group g = il/2.
 template <typename type4>
 void dequantize_blaq_q4_256_t4(device const block_blaq_q4_256 * xb, short il, thread type4 & reg) {
-    device const uint16_t * qs = ((device const uint16_t *)xb + 1); // skip fp16 scale
+    device const uint16_t * qs = ((device const uint16_t *)xb + 2); // skip fp16 d and m (4 bytes)
     const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
     const float d2 = d1 / 256.f;
-    const float md = -8.h * xb->d;
+    const float m  = (float)xb->m;
     const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
     const ushort mask1 = mask0 << 8;
 
     for (int i = 0; i < 2; i++) {
-        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
-        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + m;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + m;
     }
 }
 
@@ -208,7 +208,7 @@ template <typename type4x4>
 void dequantize_blaq_q4_128(device const block_blaq_q4_128 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = (device const uint16_t *)(xb->qs);
     const float d  = (float)xb->d;
-    const float md = -8.0f * d;
+    const float m  = (float)xb->m;
     const float d1 = d;
     const float d2 = d / 256.0f;
     const float d3 = d / 16.0f;
@@ -216,22 +216,22 @@ void dequantize_blaq_q4_128(device const block_blaq_q4_128 * xb, short il, threa
     const short b  = 4 * il;
 
     float4x4 reg_f;
-    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + md;
-    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + md;
-    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + md;
-    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + md;
-    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + md;
-    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + md;
-    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + md;
-    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + md;
-    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + md;
-    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + md;
-    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + md;
-    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + md;
-    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + md;
-    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + md;
-    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + md;
-    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + md;
+    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + m;
+    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + m;
+    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + m;
+    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + m;
+    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + m;
+    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + m;
+    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + m;
+    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + m;
+    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + m;
+    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + m;
+    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + m;
+    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + m;
+    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + m;
+    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + m;
+    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + m;
+    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + m;
     reg = (type4x4) reg_f;
 }
 
@@ -239,7 +239,7 @@ template <typename type4x4>
 void dequantize_blaq_q4_256(device const block_blaq_q4_256 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = (device const uint16_t *)(xb->qs);
     const float d  = (float)xb->d;
-    const float md = -8.0f * d;
+    const float m  = (float)xb->m;
     const float d1 = d;
     const float d2 = d / 256.0f;
     const float d3 = d / 16.0f;
@@ -247,22 +247,22 @@ void dequantize_blaq_q4_256(device const block_blaq_q4_256 * xb, short il, threa
     const short b  = 4 * il;
 
     float4x4 reg_f;
-    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + md;
-    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + md;
-    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + md;
-    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + md;
-    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + md;
-    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + md;
-    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + md;
-    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + md;
-    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + md;
-    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + md;
-    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + md;
-    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + md;
-    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + md;
-    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + md;
-    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + md;
-    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + md;
+    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + m;
+    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + m;
+    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + m;
+    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + m;
+    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + m;
+    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + m;
+    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + m;
+    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + m;
+    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + m;
+    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + m;
+    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + m;
+    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + m;
+    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + m;
+    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + m;
+    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + m;
+    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + m;
     reg = (type4x4) reg_f;
 }
 
@@ -3655,19 +3655,22 @@ void kernel_mul_mv_blaq_q4_128_f32_impl(
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const uint8_t * qs = ax[row][ib].qs + il*8;
             const float d = ax[row][ib].d;
+            const float m = ax[row][ib].m;
 
             // Group-of-8 packing: bytes [0..3] lo=[w0..w3] hi=[w4..w7],
             //                      bytes [4..7] lo=[w8..w11] hi=[w12..w15].
             // yl[0..15] = activations [il*16 .. il*16+15].
-            float sumq = 0.f;
+            // Asymmetric: weight = q*d + m → dot = d*sum(q*a) + m*sum(a)
+            float sumq = 0.f, sum_a = 0.f;
             FOR_UNROLL (short g = 0; g < 2; ++g) {
                 FOR_UNROLL (short k = 0; k < 4; ++k) {
-                    const float w0 = (float)((int)(qs[4*g + k] & 0x0F) - 8);
-                    const float w1 = (float)((int)(qs[4*g + k] >>  4)  - 8);
-                    sumq += w0 * yl[8*g + k] + w1 * yl[8*g + k + 4];
+                    const float q0 = (float)(qs[4*g + k] & 0x0F);
+                    const float q1 = (float)(qs[4*g + k] >>  4);
+                    sumq  += q0 * yl[8*g + k] + q1 * yl[8*g + k + 4];
+                    sum_a += yl[8*g + k] + yl[8*g + k + 4];
                 }
             }
-            sumf[row] += sumq * d;
+            sumf[row] += d * sumq + m * sum_a;
         }
 
         yb += NSG*NQ*QK_BLAQ_128;
@@ -3744,18 +3747,21 @@ void kernel_mul_mv_blaq_q4_256_f32_impl(
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const uint8_t * qs = ax[row][ib].qs + il*8;
             const float d = ax[row][ib].d;
+            const float m = ax[row][ib].m;
 
             // Group-of-8 packing: bytes [0..3] lo=[w0..w3] hi=[w4..w7],
             //                      bytes [4..7] lo=[w8..w11] hi=[w12..w15].
-            float sumq = 0.f;
+            // Asymmetric: weight = q*d + m → dot = d*sum(q*a) + m*sum(a)
+            float sumq = 0.f, sum_a = 0.f;
             FOR_UNROLL (short g = 0; g < 2; ++g) {
                 FOR_UNROLL (short k = 0; k < 4; ++k) {
-                    const float w0 = (float)((int)(qs[4*g + k] & 0x0F) - 8);
-                    const float w1 = (float)((int)(qs[4*g + k] >>  4)  - 8);
-                    sumq += w0 * yl[8*g + k] + w1 * yl[8*g + k + 4];
+                    const float q0 = (float)(qs[4*g + k] & 0x0F);
+                    const float q1 = (float)(qs[4*g + k] >>  4);
+                    sumq  += q0 * yl[8*g + k] + q1 * yl[8*g + k + 4];
+                    sum_a += yl[8*g + k] + yl[8*g + k + 4];
                 }
             }
-            sumf[row] += sumq * d;
+            sumf[row] += d * sumq + m * sum_a;
         }
 
         yb += NSG*NQ*QK_BLAQ_256;
