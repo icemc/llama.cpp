@@ -296,6 +296,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             break;
         case GGML_TYPE_BLAQ_Q4_128:
         case GGML_TYPE_BLAQ_Q4_256:
+        case GGML_TYPE_BLAQ_SKA_128:
+        case GGML_TYPE_BLAQ_SKA_256:
             mmq_supported = false; // asymmetric: PP uses dequant+cuBLAS path
             break;
         default:

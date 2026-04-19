@@ -62,6 +62,14 @@ void quantize_row_blaq_q4_256(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     quantize_row_blaq_q4_256_ref(x, y, k);
 }
 
+void quantize_row_blaq_ska_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_blaq_ska_128_ref(x, y, k);
+}
+
+void quantize_row_blaq_ska_256(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_blaq_ska_256_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -339,6 +347,100 @@ void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_
                 }
             }
             sumf += dy * (dx * sumi + mx * sum_a);
+        }
+    }
+    *s = sumf;
+}
+
+// Helper: get 6-bit scale from bit-stream.
+static inline uint8_t blaq_ska_cpu_get_scale(const uint8_t * buf, int idx) {
+    const int bit_off   = 6 * idx;
+    const int byte_idx  = bit_off >> 3;
+    const int bit_shift = bit_off & 7;
+    unsigned val = (unsigned)buf[byte_idx] >> bit_shift;
+    if (bit_shift > 2) val |= (unsigned)buf[byte_idx + 1] << (8 - bit_shift);
+    return (uint8_t)(val & 0x3F);
+}
+
+// BLAQ_SKA_128: 128-weight block with sub-block scales (asymmetric).
+// weight = d * sc[s] * q - dmin * mn[s]
+// dot = sum_s { dk[s] * d_a * sum(q_j * a_j) - mk[s] * d_a * sum(a_j) }
+void ggml_vec_dot_blaq_ska_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_BLAQ_SKA_128 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_blaq_ska_128 * GGML_RESTRICT x = vx;
+    const block_q8_0          * GGML_RESTRICT y = vy;
+
+    const int nb    = n / QK_BLAQ_SKA_128;
+    const int ratio = QK_BLAQ_SKA_128 / QK8_0; // 4 Q8_0 blocks per SKA block
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d    = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float dmin = GGML_CPU_FP16_TO_FP32(x[ib].dmin);
+        for (int s_idx = 0; s_idx < ratio; ++s_idx) {
+            const float dy   = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
+            const float dk   = d    * (float)blaq_ska_cpu_get_scale(x[ib].scales,     s_idx);
+            const float mk   = dmin * (float)blaq_ska_cpu_get_scale(x[ib].scales + 3, s_idx);
+            const int base_j = s_idx * (QK8_0 / 2);
+            int sumi = 0, sum_a = 0;
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int q0 = x[ib].qs[base_j + 4*g + k] & 0x0F;
+                    const int q1 = x[ib].qs[base_j + 4*g + k] >>   4;
+                    const int a0 = y[ib * ratio + s_idx].qs[8*g + k];
+                    const int a1 = y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    sumi  += q0 * a0 + q1 * a1;
+                    sum_a += a0 + a1;
+                }
+            }
+            sumf += dy * (dk * sumi - mk * sum_a);
+        }
+    }
+    *s = sumf;
+}
+
+// BLAQ_SKA_256: 256-weight block with sub-block scales (asymmetric).
+void ggml_vec_dot_blaq_ska_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_BLAQ_SKA_256 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_blaq_ska_256 * GGML_RESTRICT x = vx;
+    const block_q8_0          * GGML_RESTRICT y = vy;
+
+    const int nb    = n / QK_BLAQ_SKA_256;
+    const int ratio = QK_BLAQ_SKA_256 / QK8_0; // 8 Q8_0 blocks per SKA block
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d    = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float dmin = GGML_CPU_FP16_TO_FP32(x[ib].dmin);
+        for (int s_idx = 0; s_idx < ratio; ++s_idx) {
+            const float dy   = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
+            const float dk   = d    * (float)blaq_ska_cpu_get_scale(x[ib].scales,     s_idx);
+            const float mk   = dmin * (float)blaq_ska_cpu_get_scale(x[ib].scales + 6, s_idx);
+            const int base_j = s_idx * (QK8_0 / 2);
+            int sumi = 0, sum_a = 0;
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int q0 = x[ib].qs[base_j + 4*g + k] & 0x0F;
+                    const int q1 = x[ib].qs[base_j + 4*g + k] >>   4;
+                    const int a0 = y[ib * ratio + s_idx].qs[8*g + k];
+                    const int a1 = y[ib * ratio + s_idx].qs[8*g + k + 4];
+                    sumi  += q0 * a0 + q1 * a1;
+                    sum_a += a0 + a1;
+                }
+            }
+            sumf += dy * (dk * sumi - mk * sum_a);
         }
     }
     *s = sumf;

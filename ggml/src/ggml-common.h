@@ -168,6 +168,12 @@ typedef sycl::half2 ggml_half2;
 #define QI_BLAQ_256 (QK_BLAQ_256 / (4 * QR_BLAQ_256))  // 256/8 = 32
 #define QR_BLAQ_256 2
 
+#define QI_BLAQ_SKA_128 (QK_BLAQ_SKA_128 / (4 * QR_BLAQ_SKA_128))  // 128/8 = 16
+#define QR_BLAQ_SKA_128 2
+
+#define QI_BLAQ_SKA_256 (QK_BLAQ_SKA_256 / (4 * QR_BLAQ_SKA_256))  // 256/8 = 32
+#define QR_BLAQ_SKA_256 2
+
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
@@ -309,6 +315,34 @@ typedef struct {
 } block_blaq_q4_256;                   // total:         132 bytes
 static_assert(sizeof(block_blaq_q4_256) == 2 * sizeof(ggml_half) + QK_BLAQ_256 / 2,
               "wrong block_blaq_q4_256 size/padding");
+
+// BLAQ-SKA: BLAQ with Sub-block scales and Asymmetric offsets (Proposal C).
+// Formula: weight = d * sc[s] * q - dmin * mn[s], where s is the sub-block index.
+// sc[s] and mn[s] are 6-bit integers (0..63) packed in a bit-stream.
+//
+// SKA_128: 4 sub-blocks of 32 weights each. Scales in 3 bytes, mins in 3 bytes = 6 bytes.
+// Note: no ggml_half2 union — keeps alignment at 2 so sizeof == 74 (no padding).
+#define QK_BLAQ_SKA_128 128
+typedef struct {
+    ggml_half d;                       // fp16 super-scale
+    ggml_half dmin;                    // fp16 super-min
+    uint8_t scales[6];                 // 4×6-bit sub-scales + 4×6-bit sub-mins
+    uint8_t qs[QK_BLAQ_SKA_128 / 2];  // 4-bit nibbles:  64 bytes
+} block_blaq_ska_128;                  // total:          74 bytes
+static_assert(sizeof(block_blaq_ska_128) == 2 * sizeof(ggml_half) + 6 + QK_BLAQ_SKA_128 / 2,
+              "wrong block_blaq_ska_128 size/padding");
+
+// SKA_256: 8 sub-blocks of 32 weights each. Scales in 6 bytes, mins in 6 bytes = 12 bytes.
+// Note: no ggml_half2 union — keeps alignment at 2 so sizeof == 144 (no padding).
+#define QK_BLAQ_SKA_256 256
+typedef struct {
+    ggml_half d;                       // fp16 super-scale
+    ggml_half dmin;                    // fp16 super-min
+    uint8_t scales[12];                // 8×6-bit sub-scales + 8×6-bit sub-mins
+    uint8_t qs[QK_BLAQ_SKA_256 / 2];  // 4-bit nibbles: 128 bytes
+} block_blaq_ska_256;                  // total:         144 bytes
+static_assert(sizeof(block_blaq_ska_256) == 2 * sizeof(ggml_half) + 12 + QK_BLAQ_SKA_256 / 2,
+              "wrong block_blaq_ska_256 size/padding");
 
 //
 // Super-block quantization structures

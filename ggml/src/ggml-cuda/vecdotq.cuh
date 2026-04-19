@@ -740,6 +740,86 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_256_q8_1(
     return dm256.x * (float)sumi * ds8f.x + dm256.y * ds8f.y;
 }
 
+// BLAQ-SKA: sub-block scales + asymmetric offsets.
+// weight = d * sc[sub] * q - dmin * mn[sub]
+// dot = dk * sum(q_j*a_j) * d_a - mk * d_a * sum(a_j)
+//     = dk * sumi * ds8f.x - mk * ds8f.y
+
+// Extract 6-bit value at position idx from a packed bit-stream buffer.
+#ifndef BLAQ_SKA_GET_SCALE_F_DEFINED
+#define BLAQ_SKA_GET_SCALE_F_DEFINED
+static __device__ __forceinline__ float blaq_ska_get_scale_f(const uint8_t * buf, int idx) {
+    const int bit_off   = 6 * idx;
+    const int byte_idx  = bit_off >> 3;
+    const int bit_shift = bit_off & 7;
+    int val = buf[byte_idx] >> bit_shift;
+    if (bit_shift > 2) { val |= buf[byte_idx + 1] << (8 - bit_shift); }
+    return (float)(val & 0x3Fu);
+}
+#endif
+
+#define VDR_BLAQ_SKA_128_Q8_1_MMVQ 4
+#define VDR_BLAQ_SKA_128_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_blaq_ska_128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_ska_128 * bq = (const block_blaq_ska_128 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_SKA_128_Q8_1_MMVQ);
+
+    const float d    = __half2float(bq->d);
+    const float dmin = __half2float(bq->dmin);
+    const int sub    = iqs / VDR_BLAQ_SKA_128_Q8_1_MMVQ;
+    const float dk   = d    * blaq_ska_get_scale_f(bq->scales,     sub);
+    const float mk   = dmin * blaq_ska_get_scale_f(bq->scales + 3, sub);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_SKA_128_Q8_1_MMVQ; ++i) {
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;
+        const int hi = (v >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
+    }
+
+    const float2 ds8f = __half22float2(bq8->ds);
+    return dk * (float)sumi * ds8f.x - mk * ds8f.y;
+}
+
+#define VDR_BLAQ_SKA_256_Q8_1_MMVQ 4
+#define VDR_BLAQ_SKA_256_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_blaq_ska_256_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_ska_256 * bq = (const block_blaq_ska_256 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_SKA_256_Q8_1_MMVQ);
+
+    const float d    = __half2float(bq->d);
+    const float dmin = __half2float(bq->dmin);
+    const int sub    = iqs / VDR_BLAQ_SKA_256_Q8_1_MMVQ;
+    const float dk   = d    * blaq_ska_get_scale_f(bq->scales,     sub);
+    const float mk   = dmin * blaq_ska_get_scale_f(bq->scales + 6, sub);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_SKA_256_Q8_1_MMVQ; ++i) {
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;
+        const int hi = (v >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
+    }
+
+    const float2 ds8f = __half22float2(bq8->ds);
+    return dk * (float)sumi * ds8f.x - mk * ds8f.y;
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

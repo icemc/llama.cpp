@@ -202,7 +202,8 @@ struct quantize_state_impl {
 
         // Load BLAQ hardware profile
         const llama_ftype ft = params->ftype;
-        if (ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) {
+        if (ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256 ||
+            ft == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_128 || ft == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_256) {
             if (params->blaq_profile_path &&
                     blaq_profile_load_json(&blaq_prof, params->blaq_profile_path)) {
                 LLAMA_LOG_INFO("%s: loaded BLAQ profile from %s "
@@ -410,9 +411,11 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:        return_type = GGML_TYPE_Q4_0;   break;
-            // BLAQ: fallback to Q4_K (256-weight block), which covers the same dimensions
+            // BLAQ / BLAQ-SKA: fallback to Q4_K (256-weight block), which covers the same dimensions
             case GGML_TYPE_BLAQ_Q4_128:
-            case GGML_TYPE_BLAQ_Q4_256:  return_type = GGML_TYPE_Q4_K;   break;
+            case GGML_TYPE_BLAQ_Q4_256:
+            case GGML_TYPE_BLAQ_SKA_128:
+            case GGML_TYPE_BLAQ_SKA_256:  return_type = GGML_TYPE_Q4_K;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -940,6 +943,8 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ2_0:        return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128:  return GGML_TYPE_BLAQ_Q4_128;
         case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256:  return GGML_TYPE_BLAQ_Q4_256;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_SKA_128: return GGML_TYPE_BLAQ_SKA_128;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_SKA_256: return GGML_TYPE_BLAQ_SKA_256;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -1230,7 +1235,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // Both placeholder and final write must use EXACTLY the same element count for
     // blaq.bw_pressure (model.hparams.n_layer) so the header size stays constant.
     if (!params->dry_run &&
-        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
+        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256 ||
+         ftype == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_256)) {
         const uint32_t n_layer = model.hparams.n_layer;
         std::vector<float> bw_placeholder(n_layer, 0.0f);
         gguf_set_val_u32(ctx_outs[0].get(), "blaq.cache_line_bytes",    0);
@@ -1412,7 +1418,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 // BLAQ-Sched: accumulate per-layer bandwidth cost for metadata
                 if ((effective_type == GGML_TYPE_BLAQ_Q4_128 ||
-                     effective_type == GGML_TYPE_BLAQ_Q4_256) &&
+                     effective_type == GGML_TYPE_BLAQ_Q4_256 ||
+                     effective_type == GGML_TYPE_BLAQ_SKA_128 ||
+                     effective_type == GGML_TYPE_BLAQ_SKA_256) &&
                     qs.blaq_prof.peak_bw_bytes_per_sec > 0.0) {
                     const int64_t blck_sz = (int64_t)ggml_blck_size(effective_type);
                     const size_t  type_sz = ggml_type_size(effective_type);
@@ -1447,7 +1455,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // model.hparams.n_layer elements for blaq.bw_pressure so the header size is
     // unchanged and the data section offset in the file remains correct.
     if (!params->dry_run &&
-        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
+        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256 ||
+         ftype == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_SKA_256)) {
 
         const uint32_t n_layer = model.hparams.n_layer;
 

@@ -856,6 +856,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_BLAQ_Q4_256;
                 smem = 32*sizeof(float)*N_R0_BLAQ_Q4_256;
             } break;
+        case GGML_TYPE_BLAQ_SKA_128:
+            {
+                nsg = N_SG_BLAQ_SKA_128;
+                nr0 = N_R0_BLAQ_SKA_128;
+                smem = 32*sizeof(float)*N_R0_BLAQ_SKA_128;
+            } break;
+        case GGML_TYPE_BLAQ_SKA_256:
+            {
+                nsg = N_SG_BLAQ_SKA_256;
+                nr0 = N_R0_BLAQ_SKA_256;
+                smem = 32*sizeof(float)*N_R0_BLAQ_SKA_256;
+            } break;
         default:
             {
                 GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
@@ -1079,6 +1091,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_BLAQ_Q4_256;
                 nr0 = N_R0_BLAQ_Q4_256;
                 smem = 32*sizeof(float)*N_R0_BLAQ_Q4_256;
+            } break;
+        case GGML_TYPE_BLAQ_SKA_128:
+            {
+                nsg = N_SG_BLAQ_SKA_128;
+                nr0 = N_R0_BLAQ_SKA_128;
+                smem = 32*sizeof(float)*N_R0_BLAQ_SKA_128;
+            } break;
+        case GGML_TYPE_BLAQ_SKA_256:
+            {
+                nsg = N_SG_BLAQ_SKA_256;
+                nr0 = N_R0_BLAQ_SKA_256;
+                smem = 32*sizeof(float)*N_R0_BLAQ_SKA_256;
             } break;
         default:
             {

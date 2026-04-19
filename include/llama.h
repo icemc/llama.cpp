@@ -158,6 +158,8 @@ extern "C" {
         // BLAQ: Bandwidth- and Layout-Aware Quantization
         LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128   = 40, // 4-bit, 128-weight blocks (64-byte cache-line target)
         LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256   = 41, // 4-bit, 256-weight blocks (128-byte cache-line target)
+        LLAMA_FTYPE_MOSTLY_BLAQ_SKA_128  = 42, // BLAQ-SKA sub-block scales, 128-weight blocks
+        LLAMA_FTYPE_MOSTLY_BLAQ_SKA_256  = 43, // BLAQ-SKA sub-block scales, 256-weight blocks
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

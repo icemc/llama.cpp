@@ -84,6 +84,43 @@ static __device__ __forceinline__ void dequantize_blaq_q4_256(const void * vx, c
     v.y = (vui >>  4) * dm.x + dm.y;
 }
 
+// Get a 6-bit value from a bit-stream buffer at position idx.
+static __device__ __forceinline__ float blaq_ska_get_scale_f(const uint8_t * buf, int idx) {
+    const int bit_off   = 6 * idx;
+    const int byte_idx  = bit_off >> 3;
+    const int bit_shift = bit_off & 7;
+    unsigned val = (unsigned)buf[byte_idx] >> bit_shift;
+    if (bit_shift > 2) val |= (unsigned)buf[byte_idx + 1] << (8 - bit_shift);
+    return (float)(val & 0x3Fu);
+}
+
+static __device__ __forceinline__ void dequantize_blaq_ska_128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_blaq_ska_128 * x = (const block_blaq_ska_128 *) vx;
+    const float d    = __half2float(x[ib].d);
+    const float dmin = __half2float(x[ib].dmin);
+    // Each sub-block has 32 weights = 16 bytes; sub-block index from byte offset.
+    const int sub    = iqs / 16;
+    const float dk   = d    * blaq_ska_get_scale_f(x[ib].scales,     sub);
+    const float mk   = dmin * blaq_ska_get_scale_f(x[ib].scales + 3, sub);
+    const int vui = x[ib].qs[iqs];
+
+    v.x = (vui & 0xF) * dk - mk;
+    v.y = (vui >>  4) * dk - mk;
+}
+
+static __device__ __forceinline__ void dequantize_blaq_ska_256(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_blaq_ska_256 * x = (const block_blaq_ska_256 *) vx;
+    const float d    = __half2float(x[ib].d);
+    const float dmin = __half2float(x[ib].dmin);
+    const int sub    = iqs / 16;
+    const float dk   = d    * blaq_ska_get_scale_f(x[ib].scales,     sub);
+    const float mk   = dmin * blaq_ska_get_scale_f(x[ib].scales + 6, sub);
+    const int vui = x[ib].qs[iqs];
+
+    v.x = (vui & 0xF) * dk - mk;
+    v.y = (vui >>  4) * dk - mk;
+}
+
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 

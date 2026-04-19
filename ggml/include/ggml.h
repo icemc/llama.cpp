@@ -430,10 +430,12 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
 
         // BLAQ: Bandwidth- and Layout-Aware Quantization
-        GGML_TYPE_BLAQ_Q4_128 = 41, // 4-bit, 128-weight block (64-byte cache-line target)
-        GGML_TYPE_BLAQ_Q4_256 = 42, // 4-bit, 256-weight block (128-byte cache-line target)
+        GGML_TYPE_BLAQ_Q4_128  = 41, // 4-bit, 128-weight block (64-byte cache-line target)
+        GGML_TYPE_BLAQ_Q4_256  = 42, // 4-bit, 256-weight block (128-byte cache-line target)
+        GGML_TYPE_BLAQ_SKA_128 = 43, // BLAQ-SKA: sub-block scales, 128-weight block
+        GGML_TYPE_BLAQ_SKA_256 = 44, // BLAQ-SKA: sub-block scales, 256-weight block
 
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision
