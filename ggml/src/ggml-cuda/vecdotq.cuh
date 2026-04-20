@@ -737,6 +737,58 @@ static __device__ __forceinline__ float vec_dot_blaq_q4_256_q8_1(
     return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
 }
 
+#define VDR_BLAQ_RD_Q4_CL64_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_blaq_rd_q4_cl64_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_rd_q4_cl64 * bq = (const block_blaq_rd_q4_cl64 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_RD_Q4_CL64_Q8_1_MMVQ);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_RD_Q4_CL64_Q8_1_MMVQ; ++i) {
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;
+        const int hi = (v >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
+    }
+
+    const float2 ds8f = __half22float2(bq8->ds);
+    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+}
+
+#define VDR_BLAQ_RD_Q4_CL128_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_blaq_rd_q4_cl128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_blaq_rd_q4_cl128 * bq = (const block_blaq_rd_q4_cl128 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + (iqs / VDR_BLAQ_RD_Q4_CL128_Q8_1_MMVQ);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_BLAQ_RD_Q4_CL128_Q8_1_MMVQ; ++i) {
+        const int v  = get_int_b2(bq->qs, iqs + i);
+        const int lo = v & 0x0F0F0F0F;
+        const int hi = (v >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+
+        sumi = ggml_cuda_dp4a(lo, u0, ggml_cuda_dp4a(hi, u1, sumi));
+    }
+
+    const float2 ds8f = __half22float2(bq8->ds);
+    return __half2float(bq->d) * ((float)sumi * ds8f.x - 8.0f * ds8f.y);
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

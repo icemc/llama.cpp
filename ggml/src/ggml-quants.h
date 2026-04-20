@@ -127,6 +127,30 @@ GGML_API size_t quantize_blaq_q4_256        (const float * GGML_RESTRICT src,
                                               int64_t nrows, int64_t n_per_row,
                                               const float * imatrix);
 
+// --- BLAQ_RD_Q4_CL64 (896-weight payload, 512-byte super-block) ---
+GGML_API void   quantize_row_blaq_rd_q4_cl64_ref(const float * GGML_RESTRICT x,
+                                                  block_blaq_rd_q4_cl64 * GGML_RESTRICT y,
+                                                  int64_t k);
+GGML_API void   dequantize_row_blaq_rd_q4_cl64  (const block_blaq_rd_q4_cl64 * GGML_RESTRICT x,
+                                                  float * GGML_RESTRICT y,
+                                                  int64_t k);
+GGML_API size_t quantize_blaq_rd_q4_cl64        (const float * GGML_RESTRICT src,
+                                                  void  * GGML_RESTRICT dst,
+                                                  int64_t nrows, int64_t n_per_row,
+                                                  const float * imatrix);
+
+// --- BLAQ_RD_Q4_CL128 (1792-weight payload, 1024-byte super-block) ---
+GGML_API void   quantize_row_blaq_rd_q4_cl128_ref(const float * GGML_RESTRICT x,
+                                                   block_blaq_rd_q4_cl128 * GGML_RESTRICT y,
+                                                   int64_t k);
+GGML_API void   dequantize_row_blaq_rd_q4_cl128  (const block_blaq_rd_q4_cl128 * GGML_RESTRICT x,
+                                                   float * GGML_RESTRICT y,
+                                                   int64_t k);
+GGML_API size_t quantize_blaq_rd_q4_cl128        (const float * GGML_RESTRICT src,
+                                                   void  * GGML_RESTRICT dst,
+                                                   int64_t nrows, int64_t n_per_row,
+                                                   const float * imatrix);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

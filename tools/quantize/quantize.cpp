@@ -47,6 +47,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "TQ2_0",       LLAMA_FTYPE_MOSTLY_TQ2_0,       " 2.06 bpw ternarization",           },
     { "BLAQ_Q4_128", LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128, " 4.52 bpw BLAQ (128-weight blocks, hardware-aware)",  },
     { "BLAQ_Q4_256", LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256, " 4.51 bpw BLAQ (256-weight blocks, hardware-aware)",  },
+    { "BLAQ_RD_Q4_CL64",  LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL64,  " BLAQ-RD Q4 (CL64 profile, 1+7 super-block packing)",   },
+    { "BLAQ_RD_Q4_CL128", LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL128, " BLAQ-RD Q4 (CL128 profile, 1+7 super-block packing)",  },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.96G, +3.1836 ppl @ Llama-3-8B",  },
     { "IQ3_XXS",  LLAMA_FTYPE_MOSTLY_IQ3_XXS,  " 3.06 bpw quantization",            },

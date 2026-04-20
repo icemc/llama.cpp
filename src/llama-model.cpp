@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -27,6 +29,20 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+
+static bool llama_env_flag_enabled(const char * name) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    std::string v(value);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -318,6 +334,10 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
+
+    bool blaq_pressure_available = false;
+    std::string blaq_pressure_key;
+    std::vector<float> blaq_layer_pressure;
 
     bool has_tensor_overrides;
 };
@@ -2576,25 +2596,55 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
     hparams.rope_type = llama_model_rope_type(this);
 
-    // BLAQ-Sched: read optional bandwidth-pressure metadata written by llama-quantize
+    // BLAQ-Sched / BLAQ-RD: cache optional layer pressure metadata at load time.
     {
-        const int64_t key_count = gguf_find_key(ctx, "blaq.layer_count");
-        if (key_count >= 0) {
-            const uint32_t n_blaq_layers = gguf_get_val_u32(ctx, key_count);
+        auto load_layer_pressure = [&](const char * key) -> bool {
+            const int64_t key_idx = gguf_find_key(ctx, key);
+            if (key_idx < 0) {
+                return false;
+            }
 
+            if (gguf_get_arr_type(ctx, key_idx) != GGUF_TYPE_FLOAT32) {
+                LLAMA_LOG_WARN("%s: %s has non-f32 type in metadata, ignoring\n", __func__, key);
+                return false;
+            }
+
+            const size_t n_arr = gguf_get_arr_n(ctx, key_idx);
+            if (n_arr != (size_t) hparams.n_layer) {
+                LLAMA_LOG_WARN("%s: %s has %zu entries, expected %u, ignoring\n",
+                               __func__, key, n_arr, hparams.n_layer);
+                return false;
+            }
+
+            const float * data = static_cast<const float *>(gguf_get_arr_data(ctx, key_idx));
+            if (data == nullptr) {
+                return false;
+            }
+
+            pimpl->blaq_layer_pressure.assign(data, data + hparams.n_layer);
+            pimpl->blaq_pressure_key = key;
+            pimpl->blaq_pressure_available = true;
+            return true;
+        };
+
+        pimpl->blaq_pressure_available = false;
+        pimpl->blaq_pressure_key.clear();
+        pimpl->blaq_layer_pressure.clear();
+
+        bool loaded = load_layer_pressure("blaq.rd.layer_bw_pressure");
+        if (!loaded) {
+            loaded = load_layer_pressure("blaq.bw_pressure");
+        }
+
+        if (loaded) {
             float peak_bw = 0.f, sigma = 0.f;
             const int64_t key_bw    = gguf_find_key(ctx, "blaq.peak_bandwidth_gbs");
             const int64_t key_sigma = gguf_find_key(ctx, "blaq.contention_ratio");
             if (key_bw    >= 0) peak_bw = gguf_get_val_f32(ctx, key_bw);
             if (key_sigma >= 0) sigma   = gguf_get_val_f32(ctx, key_sigma);
 
-            LLAMA_LOG_INFO("%s: BLAQ-Sched profile found: %u layers, "
-                           "peak_bw=%.1f GB/s, sigma=%.3f\n",
-                           __func__, n_blaq_layers, (double)peak_bw, (double)sigma);
-
-            // Phase 5+: use bw_pressure array to rank layers for GPU offloading.
-            // For now, the presence of these keys is logged and future scheduling
-            // logic can read them via gguf_find_key / gguf_get_arr_data.
+            LLAMA_LOG_INFO("%s: cached BLAQ scheduler metadata from %s (%zu layers, peak_bw=%.1f GB/s, sigma=%.3f)\n",
+                           __func__, pimpl->blaq_pressure_key.c_str(), pimpl->blaq_layer_pressure.size(), (double)peak_bw, (double)sigma);
         }
     }
 }
@@ -2612,6 +2662,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
+    const bool auto_gpu_mode = params.n_gpu_layers < 0;
 
     const bool use_mmap_buffer = true;
 
@@ -2665,10 +2716,75 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
+    const bool use_blaq_smart_scheduler = llama_env_flag_enabled("LLAMA_BLAQ_SMART_SCHEDULER");
+    bool use_blaq_smart_scheduler_active = false;
+    std::vector<uint8_t> blaq_gpu_repeating;
+
+    if (use_blaq_smart_scheduler && auto_gpu_mode && !devices.empty() && n_gpu_layers > 0) {
+        if (pimpl->blaq_pressure_available && pimpl->blaq_layer_pressure.size() == (size_t) n_layer) {
+            const int n_repeating_target = std::min(std::max(n_gpu_layers - 1, 0), n_layer);
+
+            blaq_gpu_repeating.assign(n_layer, 0);
+            std::vector<int> layer_order(n_layer);
+            for (int il = 0; il < n_layer; ++il) {
+                layer_order[il] = il;
+            }
+
+            std::stable_sort(layer_order.begin(), layer_order.end(), [&](int lhs, int rhs) {
+                return pimpl->blaq_layer_pressure[lhs] > pimpl->blaq_layer_pressure[rhs];
+            });
+
+            for (int i = 0; i < n_repeating_target; ++i) {
+                blaq_gpu_repeating[layer_order[i]] = 1;
+            }
+
+            use_blaq_smart_scheduler_active = true;
+            LLAMA_LOG_INFO("%s: smart scheduler enabled via LLAMA_BLAQ_SMART_SCHEDULER=1 using %s (%d repeating layers + output)\n",
+                           __func__, pimpl->blaq_pressure_key.c_str(), n_repeating_target);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_BLAQ_SMART_SCHEDULER is set but no compatible BLAQ pressure metadata found; using sequential scheduler\n", __func__);
+        }
+    } else if (use_blaq_smart_scheduler && !auto_gpu_mode) {
+        LLAMA_LOG_INFO("%s: LLAMA_BLAQ_SMART_SCHEDULER is set but ignored because n_gpu_layers is explicitly configured (%d); using sequential scheduler\n",
+                       __func__, params.n_gpu_layers);
+    }
+
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
+        auto get_gpu_layer_dev = [&]() -> llama_model::impl::layer_dev {
+            if (devices.empty()) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+
+            const float rel_pos = float(il + 1) / float(n_layer + 1);
+            size_t layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), rel_pos) - splits.begin();
+            if (layer_gpu >= n_devices()) {
+                layer_gpu = n_devices() - 1;
+            }
+            auto * dev = devices.at(layer_gpu);
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        };
+
+        if (use_blaq_smart_scheduler_active) {
+            if (il < n_layer) {
+                if (!blaq_gpu_repeating[il]) {
+                    LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+                    return {cpu_dev, &pimpl->cpu_buft_list};
+                }
+                return get_gpu_layer_dev();
+            }
+
+            if (n_gpu_layers <= 0 || devices.empty()) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            return get_gpu_layer_dev();
+        }
+
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -7759,19 +7875,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+        int n_repeating = 0;
+        for (const auto & ld : pimpl->dev_layer) {
+            if (ld.dev != cpu_dev) {
+                ++n_repeating;
+            }
+        }
 
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
+        const bool output_on_gpu = pimpl->dev_output.dev != cpu_dev;
+        if (output_on_gpu) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
         const int max_backend_supported_layers = hparams.n_layer + 1;
         const int max_offloadable_layers       = hparams.n_layer + 1;
 
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+        const int n_offloaded = n_repeating + (output_on_gpu ? 1 : 0);
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_offloaded, max_offloadable_layers), max_backend_supported_layers);
     }
 
     // print memory requirements per buffer type

@@ -159,6 +159,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128   = 40, // 4-bit, 128-weight blocks (64-byte cache-line target)
         LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256   = 41, // 4-bit, 256-weight blocks (128-byte cache-line target)
 
+        // BLAQ-RD: rate-distortion variants with 1+7 super-block packing
+        LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL64  = 42, // 64-byte line profile (896-weight payload)
+        LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL128 = 43, // 128-byte line profile (1792-weight payload)
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 

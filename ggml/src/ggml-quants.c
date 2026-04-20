@@ -5407,6 +5407,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_blaq_q4_256, data, nb);
             } break;
+        case GGML_TYPE_BLAQ_RD_Q4_CL64:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_blaq_rd_q4_cl64, data, nb);
+            } break;
+        case GGML_TYPE_BLAQ_RD_Q4_CL128:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_blaq_rd_q4_cl128, data, nb);
+            } break;
 
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
@@ -5668,6 +5676,194 @@ size_t quantize_blaq_q4_256(const float * GGML_RESTRICT src, void * GGML_RESTRIC
     for (int64_t r = 0; r < nrows; ++r) {
         quantize_row_blaq_q4_256_impl(src, (block_blaq_q4_256 *)out,
                                        n_per_row, imatrix);
+        src += n_per_row;
+        out += row_size;
+    }
+    return nrows * row_size;
+}
+
+// ================================================================
+// BLAQ_RD_Q4_CL64
+// ================================================================
+
+void quantize_row_blaq_rd_q4_cl64_ref(const float * GGML_RESTRICT x,
+                                      block_blaq_rd_q4_cl64 * GGML_RESTRICT y,
+                                      int64_t k) {
+    assert(k % QK_BLAQ_RD_CL64 == 0);
+    const int64_t nb = k / QK_BLAQ_RD_CL64;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x + i * QK_BLAQ_RD_CL64;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_RD_CL64; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        const float d = amax / 7.f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].header, 0, sizeof(y[i].header));
+        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_RD_CL64 / 2); continue; }
+
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_RD_CL64, 1.f / d);
+    }
+}
+
+void dequantize_row_blaq_rd_q4_cl64(const block_blaq_rd_q4_cl64 * GGML_RESTRICT x,
+                                    float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BLAQ_RD_CL64 == 0);
+    const int64_t nb = k / QK_BLAQ_RD_CL64;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * out = y + i * QK_BLAQ_RD_CL64;
+
+        const int ngroups = QK_BLAQ_RD_CL64 / 8;
+        for (int g = 0; g < ngroups; ++g) {
+            float * w = out + g * 8;
+            for (int j = 0; j < 4; ++j) {
+                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
+                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
+            }
+        }
+    }
+}
+
+static void quantize_row_blaq_rd_q4_cl64_impl(const float * GGML_RESTRICT x,
+                                               block_blaq_rd_q4_cl64 * GGML_RESTRICT y,
+                                               int64_t n, const float * imatrix) {
+    assert(n % QK_BLAQ_RD_CL64 == 0);
+    const int64_t nb = n / QK_BLAQ_RD_CL64;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x   + i * QK_BLAQ_RD_CL64;
+        const float * im  = imatrix ? imatrix + i * QK_BLAQ_RD_CL64 : NULL;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_RD_CL64; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        if (amax == 0.f) {
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].header, 0, sizeof(y[i].header));
+            memset(y[i].qs, 0x88, QK_BLAQ_RD_CL64 / 2);
+            continue;
+        }
+
+        float d;
+        if (im) {
+            d = blaq_find_scale_gs(src, im, QK_BLAQ_RD_CL64, amax / 15.f, amax / 7.f);
+        } else {
+            d = amax / 7.f;
+        }
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].header, 0, sizeof(y[i].header));
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_RD_CL64, (d > 0.f) ? 1.f / d : 0.f);
+    }
+}
+
+size_t quantize_blaq_rd_q4_cl64(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                                int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    assert(n_per_row % QK_BLAQ_RD_CL64 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_BLAQ_RD_Q4_CL64, n_per_row);
+    if (!imatrix) {
+        quantize_row_blaq_rd_q4_cl64_ref(src, (block_blaq_rd_q4_cl64 *)dst,
+                                         (int64_t)nrows * n_per_row);
+        return nrows * row_size;
+    }
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_blaq_rd_q4_cl64_impl(src, (block_blaq_rd_q4_cl64 *)out,
+                                          n_per_row, imatrix);
+        src += n_per_row;
+        out += row_size;
+    }
+    return nrows * row_size;
+}
+
+// ================================================================
+// BLAQ_RD_Q4_CL128
+// ================================================================
+
+void quantize_row_blaq_rd_q4_cl128_ref(const float * GGML_RESTRICT x,
+                                       block_blaq_rd_q4_cl128 * GGML_RESTRICT y,
+                                       int64_t k) {
+    assert(k % QK_BLAQ_RD_CL128 == 0);
+    const int64_t nb = k / QK_BLAQ_RD_CL128;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x + i * QK_BLAQ_RD_CL128;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_RD_CL128; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        const float d = amax / 7.f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].header, 0, sizeof(y[i].header));
+        if (d == 0.f) { memset(y[i].qs, 0x88, QK_BLAQ_RD_CL128 / 2); continue; }
+
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_RD_CL128, 1.f / d);
+    }
+}
+
+void dequantize_row_blaq_rd_q4_cl128(const block_blaq_rd_q4_cl128 * GGML_RESTRICT x,
+                                     float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BLAQ_RD_CL128 == 0);
+    const int64_t nb = k / QK_BLAQ_RD_CL128;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * out = y + i * QK_BLAQ_RD_CL128;
+
+        const int ngroups = QK_BLAQ_RD_CL128 / 8;
+        for (int g = 0; g < ngroups; ++g) {
+            float * w = out + g * 8;
+            for (int j = 0; j < 4; ++j) {
+                w[j]     = ((x[i].qs[4*g + j] & 0x0F) - 8) * d;
+                w[j + 4] = ((x[i].qs[4*g + j] >>   4) - 8) * d;
+            }
+        }
+    }
+}
+
+static void quantize_row_blaq_rd_q4_cl128_impl(const float * GGML_RESTRICT x,
+                                                block_blaq_rd_q4_cl128 * GGML_RESTRICT y,
+                                                int64_t n, const float * imatrix) {
+    assert(n % QK_BLAQ_RD_CL128 == 0);
+    const int64_t nb = n / QK_BLAQ_RD_CL128;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * src = x   + i * QK_BLAQ_RD_CL128;
+        const float * im  = imatrix ? imatrix + i * QK_BLAQ_RD_CL128 : NULL;
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_BLAQ_RD_CL128; ++j) amax = fmaxf(amax, fabsf(src[j]));
+        if (amax == 0.f) {
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            memset(y[i].header, 0, sizeof(y[i].header));
+            memset(y[i].qs, 0x88, QK_BLAQ_RD_CL128 / 2);
+            continue;
+        }
+
+        float d;
+        if (im) {
+            d = blaq_find_scale_gs(src, im, QK_BLAQ_RD_CL128, amax / 15.f, amax / 7.f);
+        } else {
+            d = amax / 7.f;
+        }
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].header, 0, sizeof(y[i].header));
+        blaq_pack_block(src, y[i].qs, QK_BLAQ_RD_CL128, (d > 0.f) ? 1.f / d : 0.f);
+    }
+}
+
+size_t quantize_blaq_rd_q4_cl128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                                 int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    assert(n_per_row % QK_BLAQ_RD_CL128 == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_BLAQ_RD_Q4_CL128, n_per_row);
+    if (!imatrix) {
+        quantize_row_blaq_rd_q4_cl128_ref(src, (block_blaq_rd_q4_cl128 *)dst,
+                                          (int64_t)nrows * n_per_row);
+        return nrows * row_size;
+    }
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_blaq_rd_q4_cl128_impl(src, (block_blaq_rd_q4_cl128 *)out,
+                                           n_per_row, imatrix);
         src += n_per_row;
         out += row_size;
     }

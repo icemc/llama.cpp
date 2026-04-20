@@ -39,6 +39,16 @@ enum class tensor_category {
     OTHER
 };
 
+static bool is_blaq_ftype(const llama_ftype ftype) {
+    return ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 ||
+           ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256;
+}
+
+static bool is_blaq_rd_ftype(const llama_ftype ftype) {
+    return ftype == LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL64 ||
+           ftype == LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL128;
+}
+
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -202,7 +212,7 @@ struct quantize_state_impl {
 
         // Load BLAQ hardware profile
         const llama_ftype ft = params->ftype;
-        if (ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ft == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) {
+        if (is_blaq_ftype(ft) || is_blaq_rd_ftype(ft)) {
             if (params->blaq_profile_path &&
                     blaq_profile_load_json(&blaq_prof, params->blaq_profile_path)) {
                 LLAMA_LOG_INFO("%s: loaded BLAQ profile from %s "
@@ -413,6 +423,9 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             // BLAQ: fallback to Q4_K (256-weight block), which covers the same dimensions
             case GGML_TYPE_BLAQ_Q4_128:
             case GGML_TYPE_BLAQ_Q4_256:  return_type = GGML_TYPE_Q4_K;   break;
+            // BLAQ-RD: fallback to Q4_K for incompatible tensor shapes
+            case GGML_TYPE_BLAQ_RD_Q4_CL64:
+            case GGML_TYPE_BLAQ_RD_Q4_CL128: return_type = GGML_TYPE_Q4_K; break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -527,6 +540,63 @@ static ggml_type blaq_select_type(
     const float cost256 = erec256 + prof->lambda_bw * cbw256;
 
     return (cost128 <= cost256) ? C128 : C256;
+}
+
+// BLAQ-RD per-tensor selector between CL64 and CL128 variants.
+static ggml_type blaq_rd_select_type(
+        const float          * f32_row,
+        const float          * imatrix,
+        int64_t                n_per_row,
+        const blaq_profile_t * prof) {
+
+    const ggml_type C64  = GGML_TYPE_BLAQ_RD_Q4_CL64;
+    const ggml_type C128 = GGML_TYPE_BLAQ_RD_Q4_CL128;
+
+    const int64_t blk64  = (int64_t)ggml_blck_size(C64);
+    const int64_t blk128 = (int64_t)ggml_blck_size(C128);
+    const size_t  bsz64  = ggml_type_size(C64);
+    const size_t  bsz128 = ggml_type_size(C128);
+
+    const bool fits64  = (blk64 > 0 && n_per_row % blk64 == 0);
+    const bool fits128 = (blk128 > 0 && n_per_row % blk128 == 0);
+
+    if (!fits64 && !fits128) return C64;
+    if (!fits128)            return C64;
+    if (!fits64)             return C128;
+
+    auto erec = [&](int64_t s) -> float {
+        float err = 0.f;
+        for (int64_t g = 0; g < n_per_row / s; ++g) {
+            float amax = 0.f;
+            for (int64_t j = g * s; j < (g + 1) * s; ++j) {
+                amax = fmaxf(amax, fabsf(f32_row[j]));
+            }
+            const float d = amax / 7.f;
+            if (d == 0.f) continue;
+            const float id = 1.f / d;
+            for (int64_t j = g * s; j < (g + 1) * s; ++j) {
+                float q = roundf(f32_row[j] * id);
+                q = fmaxf(-8.f, fminf(7.f, q));
+                const float diff = f32_row[j] - q * d;
+                const float w    = imatrix ? imatrix[j] : 1.f;
+                err += w * diff * diff;
+            }
+        }
+        return err;
+    };
+
+    const float erec64  = erec(blk64);
+    const float erec128 = erec(blk128);
+
+    const float cbw64 = (float)(n_per_row / blk64) * (float)bsz64
+                        / (float)prof->peak_bw_bytes_per_sec;
+    const float cbw128 = (float)(n_per_row / blk128) * (float)bsz128
+                         / (float)prof->peak_bw_bytes_per_sec;
+
+    const float cost64  = erec64  + prof->lambda_bw * cbw64;
+    const float cost128 = erec128 + prof->lambda_bw * cbw128;
+
+    return (cost64 <= cost128) ? C64 : C128;
 }
 
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
@@ -940,6 +1010,8 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ2_0:        return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128:  return GGML_TYPE_BLAQ_Q4_128;
         case LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256:  return GGML_TYPE_BLAQ_Q4_256;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL64:  return GGML_TYPE_BLAQ_RD_Q4_CL64;
+        case LLAMA_FTYPE_MOSTLY_BLAQ_RD_Q4_CL128: return GGML_TYPE_BLAQ_RD_Q4_CL128;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -1181,6 +1253,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // BLAQ-Sched: per-layer bandwidth pressure accumulator (layer_idx → Cbw sum)
     std::map<int, float> blaq_layer_cbw;
 
+    // BLAQ-RD metadata accumulators (layer-indexed, fixed size for header stability)
+    const uint32_t n_layer = model.hparams.n_layer;
+    std::vector<float>    blaq_rd_layer_bw_pressure(n_layer, 0.0f);
+    std::vector<uint64_t> blaq_rd_layer_mem_bytes(n_layer, 0);
+    std::vector<uint32_t> blaq_rd_layer_group_count(n_layer, 0);
+
     std::vector<std::thread> workers;
     workers.reserve(nthread);
 
@@ -1229,9 +1307,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // The placeholder is overwritten with real values after the quantization loop.
     // Both placeholder and final write must use EXACTLY the same element count for
     // blaq.bw_pressure (model.hparams.n_layer) so the header size stays constant.
-    if (!params->dry_run &&
-        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
-        const uint32_t n_layer = model.hparams.n_layer;
+    if (!params->dry_run && is_blaq_ftype(ftype)) {
         std::vector<float> bw_placeholder(n_layer, 0.0f);
         gguf_set_val_u32(ctx_outs[0].get(), "blaq.cache_line_bytes",    0);
         gguf_set_val_f32(ctx_outs[0].get(), "blaq.peak_bandwidth_gbs",  0.0f);
@@ -1240,6 +1316,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         gguf_set_val_u32(ctx_outs[0].get(), "blaq.layer_count",         n_layer);
         gguf_set_arr_data(ctx_outs[0].get(), "blaq.bw_pressure",
                           GGUF_TYPE_FLOAT32, bw_placeholder.data(), n_layer);
+    }
+
+    if (!params->dry_run && is_blaq_rd_ftype(ftype)) {
+        std::vector<float>    f32_placeholder(n_layer, 0.0f);
+        std::vector<uint64_t> u64_placeholder(n_layer, 0);
+        std::vector<uint32_t> u32_placeholder(n_layer, 0);
+
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.rd.version", 1);
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.rd.layer_count", n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_bw_pressure",
+                          GGUF_TYPE_FLOAT32, f32_placeholder.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_mem_bytes",
+                          GGUF_TYPE_UINT64, u64_placeholder.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_group_count",
+                          GGUF_TYPE_UINT32, u32_placeholder.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_avg_group_bytes",
+                          GGUF_TYPE_FLOAT32, f32_placeholder.data(), n_layer);
+        gguf_set_val_str(ctx_outs[0].get(), "blaq.rd.scheduler_mode", "layer_bw_pressure");
     }
 
     // no output file for --dry-run
@@ -1366,8 +1460,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 // BLAQ: if this is a BLAQ ftype, run the cost-based type selector now
                 // that we have access to the fp32 data. Override new_type in-place.
-                if ((ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 ||
-                     ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256) &&
+                 if (is_blaq_ftype(ftype) &&
                     new_type == tm.target_type &&          // not already overridden by --tensor-type
                     (new_type == GGML_TYPE_BLAQ_Q4_128 || new_type == GGML_TYPE_BLAQ_Q4_256)) {
 
@@ -1375,6 +1468,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         f32_data, imatrix, n_per_row, &qs.blaq_prof);
                     if (selected != new_type) {
                         LLAMA_LOG_INFO("[BLAQ] %s: %s -> %s (cost-based selection)\n",
+                                       name.c_str(),
+                                       ggml_type_name(new_type),
+                                       ggml_type_name(selected));
+                        const_cast<tensor_metadata &>(tm).blaq_refined_type = selected;
+                    }
+                } else if (is_blaq_rd_ftype(ftype) &&
+                           new_type == tm.target_type &&
+                           (new_type == GGML_TYPE_BLAQ_RD_Q4_CL64 || new_type == GGML_TYPE_BLAQ_RD_Q4_CL128)) {
+
+                    const ggml_type selected = blaq_rd_select_type(
+                        f32_data, imatrix, n_per_row, &qs.blaq_prof);
+                    if (selected != new_type) {
+                        LLAMA_LOG_INFO("[BLAQ-RD] %s: %s -> %s (cost-based selection)\n",
                                        name.c_str(),
                                        ggml_type_name(new_type),
                                        ggml_type_name(selected));
@@ -1427,6 +1533,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                     }
                 }
+
+                if (effective_type == GGML_TYPE_BLAQ_RD_Q4_CL64 ||
+                    effective_type == GGML_TYPE_BLAQ_RD_Q4_CL128) {
+                    const int layer_idx = blaq_parse_layer_idx(name);
+                    if (layer_idx >= 0 && (uint32_t)layer_idx < n_layer) {
+                        blaq_rd_layer_mem_bytes[layer_idx] += (uint64_t)new_size;
+
+                        const int64_t blck_sz = (int64_t) ggml_blck_size(effective_type);
+                        if (blck_sz > 0 && n_per_row % blck_sz == 0) {
+                            const uint64_t groups_per_row = (uint64_t)(n_per_row / blck_sz);
+                            const uint64_t total_rows = (uint64_t)nrows * (uint64_t)tensor->ne[2];
+                            const uint64_t total_groups = groups_per_row * total_rows;
+
+                            if (total_groups > UINT32_MAX - blaq_rd_layer_group_count[layer_idx]) {
+                                blaq_rd_layer_group_count[layer_idx] = UINT32_MAX;
+                            } else {
+                                blaq_rd_layer_group_count[layer_idx] += (uint32_t) total_groups;
+                            }
+                        }
+
+                        if (qs.blaq_prof.peak_bw_bytes_per_sec > 0.0) {
+                            const float mean_im = blaq_mean_imatrix(imatrix, n_per_row);
+                            blaq_rd_layer_bw_pressure[layer_idx] +=
+                                mean_im * (float)((double)new_size / qs.blaq_prof.peak_bw_bytes_per_sec);
+                        }
+                    }
+                }
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
@@ -1446,10 +1579,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // new_ofstream) with the real computed values.  Both writes must use exactly
     // model.hparams.n_layer elements for blaq.bw_pressure so the header size is
     // unchanged and the data section offset in the file remains correct.
-    if (!params->dry_run &&
-        (ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_128 || ftype == LLAMA_FTYPE_MOSTLY_BLAQ_Q4_256)) {
-
-        const uint32_t n_layer = model.hparams.n_layer;
+    if (!params->dry_run && is_blaq_ftype(ftype)) {
 
         float cbw_max = 1e-30f;
         for (const auto & kv : blaq_layer_cbw) cbw_max = std::max(cbw_max, kv.second);
@@ -1476,6 +1606,39 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         LLAMA_LOG_INFO("%s: BLAQ-Sched: wrote bandwidth pressure for %zu / %u layers\n",
                        __func__, blaq_layer_cbw.size(), n_layer);
+    }
+
+    if (!params->dry_run && is_blaq_rd_ftype(ftype)) {
+        std::vector<float> layer_bw_pressure(n_layer, 0.0f);
+        std::vector<float> layer_avg_group_bytes(n_layer, 0.0f);
+
+        float cbw_max = 1e-30f;
+        for (uint32_t i = 0; i < n_layer; ++i) {
+            cbw_max = std::max(cbw_max, blaq_rd_layer_bw_pressure[i]);
+            if (blaq_rd_layer_group_count[i] > 0) {
+                layer_avg_group_bytes[i] =
+                    (float) ((double) blaq_rd_layer_mem_bytes[i] / (double) blaq_rd_layer_group_count[i]);
+            }
+        }
+
+        for (uint32_t i = 0; i < n_layer; ++i) {
+            layer_bw_pressure[i] = blaq_rd_layer_bw_pressure[i] / cbw_max;
+        }
+
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.rd.version", 1);
+        gguf_set_val_u32(ctx_outs[0].get(), "blaq.rd.layer_count", n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_bw_pressure",
+                          GGUF_TYPE_FLOAT32, layer_bw_pressure.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_mem_bytes",
+                          GGUF_TYPE_UINT64, blaq_rd_layer_mem_bytes.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_group_count",
+                          GGUF_TYPE_UINT32, blaq_rd_layer_group_count.data(), n_layer);
+        gguf_set_arr_data(ctx_outs[0].get(), "blaq.rd.layer_avg_group_bytes",
+                          GGUF_TYPE_FLOAT32, layer_avg_group_bytes.data(), n_layer);
+        gguf_set_val_str(ctx_outs[0].get(), "blaq.rd.scheduler_mode", "layer_bw_pressure");
+
+        LLAMA_LOG_INFO("%s: BLAQ-RD: wrote scheduler metadata for %u layers\n",
+                       __func__, n_layer);
     }
 
     if (!params->dry_run) {

@@ -62,6 +62,14 @@ void quantize_row_blaq_q4_256(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     quantize_row_blaq_q4_256_ref(x, y, k);
 }
 
+void quantize_row_blaq_rd_q4_cl64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_blaq_rd_q4_cl64_ref(x, y, k);
+}
+
+void quantize_row_blaq_rd_q4_cl128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_blaq_rd_q4_cl128_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -338,6 +346,79 @@ void ggml_vec_dot_blaq_q4_256_q8_0_generic(int n, float * GGML_RESTRICT s, size_
     }
     *s = sumf;
 }
+
+// BLAQ_RD_Q4_CL64: 896-weight payload in a 512-byte super-block
+void ggml_vec_dot_blaq_rd_q4_cl64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_BLAQ_RD_CL64 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_blaq_rd_q4_cl64 * GGML_RESTRICT x = vx;
+    const block_q8_0            * GGML_RESTRICT y = vy;
+
+    const int nb    = n / QK_BLAQ_RD_CL64;
+    const int ratio = QK_BLAQ_RD_CL64 / QK8_0; // 28 sub-blocks of 32
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int s_idx = 0; s_idx < ratio; ++s_idx) {
+            const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
+            const int base_j = s_idx * (QK8_0 / 2);
+            int sumi = 0;
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
+                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
+                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
+                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                }
+            }
+            sumf += dx * dy * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// BLAQ_RD_Q4_CL128: 1792-weight payload in a 1024-byte super-block
+void ggml_vec_dot_blaq_rd_q4_cl128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_BLAQ_RD_CL128 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_blaq_rd_q4_cl128 * GGML_RESTRICT x = vx;
+    const block_q8_0             * GGML_RESTRICT y = vy;
+
+    const int nb    = n / QK_BLAQ_RD_CL128;
+    const int ratio = QK_BLAQ_RD_CL128 / QK8_0; // 56 sub-blocks of 32
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int s_idx = 0; s_idx < ratio; ++s_idx) {
+            const float dy = GGML_CPU_FP16_TO_FP32(y[ib * ratio + s_idx].d);
+            const int base_j = s_idx * (QK8_0 / 2);
+            int sumi = 0;
+            for (int g = 0; g < QK8_0 / 8; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    const int v0 = (x[ib].qs[base_j + 4*g + k] & 0x0F) - 8;
+                    const int v1 = (x[ib].qs[base_j + 4*g + k] >>   4) - 8;
+                    sumi += v0 * y[ib * ratio + s_idx].qs[8*g + k] +
+                            v1 * y[ib * ratio + s_idx].qs[8*g + k + 4];
+                }
+            }
+            sumf += dx * dy * sumi;
+        }
+    }
+    *s = sumf;
+}
+
 
 void ggml_vec_dot_q5_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;

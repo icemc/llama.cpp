@@ -433,7 +433,11 @@ extern "C" {
         GGML_TYPE_BLAQ_Q4_128 = 41, // 4-bit, 128-weight block (64-byte cache-line target)
         GGML_TYPE_BLAQ_Q4_256 = 42, // 4-bit, 256-weight block (128-byte cache-line target)
 
-        GGML_TYPE_COUNT   = 43,
+                // BLAQ-RD: 1+7 header/payload super-blocks (cache-line profile naming)
+                GGML_TYPE_BLAQ_RD_Q4_CL64  = 43, // 4-bit payload, 64-byte header line + 7 payload lines
+                GGML_TYPE_BLAQ_RD_Q4_CL128 = 44, // 4-bit payload, 128-byte header line + 7 payload lines
+
+                GGML_TYPE_COUNT   = 45,
     };
 
     // precision

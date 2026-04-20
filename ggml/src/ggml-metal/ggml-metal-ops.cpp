@@ -2056,6 +2056,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
            op->src[0]->type == GGML_TYPE_BLAQ_Q4_128 ||
            op->src[0]->type == GGML_TYPE_BLAQ_Q4_256 ||
+                     op->src[0]->type == GGML_TYPE_BLAQ_RD_Q4_CL64 ||
+                     op->src[0]->type == GGML_TYPE_BLAQ_RD_Q4_CL128 ||
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (

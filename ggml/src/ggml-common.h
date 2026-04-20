@@ -168,6 +168,12 @@ typedef sycl::half2 ggml_half2;
 #define QI_BLAQ_256 (QK_BLAQ_256 / (4 * QR_BLAQ_256))  // 256/8 = 32
 #define QR_BLAQ_256 2
 
+#define QI_BLAQ_RD_CL64  (QK_BLAQ_RD_CL64  / (4 * QR_BLAQ_RD_CL64))   // 896/8 = 112
+#define QR_BLAQ_RD_CL64  2
+
+#define QI_BLAQ_RD_CL128 (QK_BLAQ_RD_CL128 / (4 * QR_BLAQ_RD_CL128))  // 1792/8 = 224
+#define QR_BLAQ_RD_CL128 2
+
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
@@ -295,6 +301,30 @@ typedef struct {
 } block_blaq_q4_256;                   // total:              130 bytes
 static_assert(sizeof(block_blaq_q4_256) == sizeof(ggml_half) + QK_BLAQ_256 / 2,
               "wrong block_blaq_q4_256 size/padding");
+
+// BLAQ-RD_Q4_CL64: 1+7 line split with 64-byte cache-line profile
+// Total super-block: 512 bytes = 64-byte header + 448-byte q4 payload
+// Payload stores 896 weights at 4-bit each.
+#define QK_BLAQ_RD_CL64 896
+typedef struct {
+    ggml_half d;                                        // fp16 global scale in header: 2 bytes
+    uint8_t   header[64 - sizeof(ggml_half)];          // reserved header metadata bytes
+    uint8_t   qs[QK_BLAQ_RD_CL64 / 2];                 // 4-bit nibbles payload: 448 bytes
+} block_blaq_rd_q4_cl64;
+static_assert(sizeof(block_blaq_rd_q4_cl64) == 64 + QK_BLAQ_RD_CL64 / 2,
+              "wrong block_blaq_rd_q4_cl64 size/padding");
+
+// BLAQ-RD_Q4_CL128: 1+7 line split with 128-byte cache-line profile
+// Total super-block: 1024 bytes = 128-byte header + 896-byte q4 payload
+// Payload stores 1792 weights at 4-bit each.
+#define QK_BLAQ_RD_CL128 1792
+typedef struct {
+    ggml_half d;                                        // fp16 global scale in header: 2 bytes
+    uint8_t   header[128 - sizeof(ggml_half)];         // reserved header metadata bytes
+    uint8_t   qs[QK_BLAQ_RD_CL128 / 2];                // 4-bit nibbles payload: 896 bytes
+} block_blaq_rd_q4_cl128;
+static_assert(sizeof(block_blaq_rd_q4_cl128) == 128 + QK_BLAQ_RD_CL128 / 2,
+              "wrong block_blaq_rd_q4_cl128 size/padding");
 
 //
 // Super-block quantization structures

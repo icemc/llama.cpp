@@ -3,6 +3,120 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+template<typename src_block_t, typename dst_block_t, int qk_src, int qk_dst>
+static __global__ void convert_blaq_rd_superblock_to_blaq_blocks(
+        const src_block_t * __restrict__ src,
+        dst_block_t       * __restrict__ dst,
+        const int64_t blocks_per_row_src,
+        const int64_t s01_src,
+        const int64_t s02_src,
+        const int64_t s03_src,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3) {
+    static_assert(qk_src % qk_dst == 0, "qk_src must be divisible by qk_dst");
+
+    constexpr int payload_src_bytes = qk_src / 2;
+    constexpr int payload_dst_bytes = qk_dst / 2;
+    constexpr int subblocks_per_superblock = qk_src / qk_dst;
+
+    const int64_t b_src = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b_src >= blocks_per_row_src) {
+        return;
+    }
+
+    const int64_t i1 = blockIdx.y;
+    const int64_t i0203 = blockIdx.z;
+    const int64_t i3 = i0203 / ne2;
+    const int64_t i2 = i0203 - i3 * ne2;
+
+    if (i1 >= ne1 || i2 >= ne2 || i3 >= ne3) {
+        return;
+    }
+
+    const int64_t src_idx = i3 * s03_src + i2 * s02_src + i1 * s01_src + b_src;
+    const src_block_t src_block = src[src_idx];
+
+    const int64_t blocks_per_row_dst = blocks_per_row_src * subblocks_per_superblock;
+    const int64_t dst_row_base = ((i3 * ne2 + i2) * ne1 + i1) * blocks_per_row_dst;
+    const int64_t dst_block_base = dst_row_base + b_src * subblocks_per_superblock;
+
+#pragma unroll
+    for (int sb = 0; sb < subblocks_per_superblock; ++sb) {
+        dst_block_t out_block;
+        out_block.d = src_block.d;
+
+#pragma unroll
+        for (int i = 0; i < payload_dst_bytes; ++i) {
+            out_block.qs[i] = src_block.qs[sb * payload_dst_bytes + i];
+        }
+
+        dst[dst_block_base + sb] = out_block;
+    }
+
+    GGML_UNUSED(payload_src_bytes);
+}
+
+static void convert_blaq_rd_q4_cl64_to_blaq_q4_128_cuda(
+        const void * src,
+        void * dst,
+        const int64_t ne00,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3,
+        const int64_t s01_src,
+        const int64_t s02_src,
+        const int64_t s03_src,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_BLAQ_RD_CL64 == 0);
+
+    const int64_t blocks_per_row_src = ne00 / QK_BLAQ_RD_CL64;
+    const dim3 num_blocks((blocks_per_row_src + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne1, ne2 * ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+
+    convert_blaq_rd_superblock_to_blaq_blocks<block_blaq_rd_q4_cl64, block_blaq_q4_128, QK_BLAQ_RD_CL64, QK_BLAQ_128>
+        <<<num_blocks, block_size, 0, stream>>>(
+            (const block_blaq_rd_q4_cl64 *) src,
+            (block_blaq_q4_128 *) dst,
+            blocks_per_row_src,
+            s01_src,
+            s02_src,
+            s03_src,
+            ne1,
+            ne2,
+            ne3);
+}
+
+static void convert_blaq_rd_q4_cl128_to_blaq_q4_256_cuda(
+        const void * src,
+        void * dst,
+        const int64_t ne00,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3,
+        const int64_t s01_src,
+        const int64_t s02_src,
+        const int64_t s03_src,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_BLAQ_RD_CL128 == 0);
+
+    const int64_t blocks_per_row_src = ne00 / QK_BLAQ_RD_CL128;
+    const dim3 num_blocks((blocks_per_row_src + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne1, ne2 * ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+
+    convert_blaq_rd_superblock_to_blaq_blocks<block_blaq_rd_q4_cl128, block_blaq_q4_256, QK_BLAQ_RD_CL128, QK_BLAQ_256>
+        <<<num_blocks, block_size, 0, stream>>>(
+            (const block_blaq_rd_q4_cl128 *) src,
+            (block_blaq_q4_256 *) dst,
+            blocks_per_row_src,
+            s01_src,
+            s02_src,
+            s03_src,
+            ne1,
+            ne2,
+            ne3);
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
@@ -118,6 +232,45 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
+    ggml_type type_src0_mmq = src0->type;
+    const char * src0_mmq_d = src0_d;
+    int64_t s01_mmq = s01;
+    int64_t s02_mmq = s02;
+    int64_t s03_mmq = s03;
+    ggml_cuda_pool_alloc<char> src0_mmq_conv(ctx.pool());
+
+    if (src0->type == GGML_TYPE_BLAQ_RD_Q4_CL64) {
+        GGML_ASSERT(ne00 % QK_BLAQ_RD_CL64 == 0);
+
+        const int64_t nblocks_per_row_conv = ne00 / QK_BLAQ_128;
+        const size_t nbytes_src0_conv = ne03 * ne02 * ne01 * nblocks_per_row_conv * sizeof(block_blaq_q4_128);
+        src0_mmq_conv.alloc(nbytes_src0_conv);
+
+        convert_blaq_rd_q4_cl64_to_blaq_q4_128_cuda(src0_d, src0_mmq_conv.get(), ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_mmq_d = src0_mmq_conv.get();
+        type_src0_mmq = GGML_TYPE_BLAQ_Q4_128;
+        s01_mmq = nblocks_per_row_conv;
+        s02_mmq = ne01 * s01_mmq;
+        s03_mmq = ne02 * s02_mmq;
+    } else if (src0->type == GGML_TYPE_BLAQ_RD_Q4_CL128) {
+        GGML_ASSERT(ne00 % QK_BLAQ_RD_CL128 == 0);
+
+        const int64_t nblocks_per_row_conv = ne00 / QK_BLAQ_256;
+        const size_t nbytes_src0_conv = ne03 * ne02 * ne01 * nblocks_per_row_conv * sizeof(block_blaq_q4_256);
+        src0_mmq_conv.alloc(nbytes_src0_conv);
+
+        convert_blaq_rd_q4_cl128_to_blaq_q4_256_cuda(src0_d, src0_mmq_conv.get(), ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_mmq_d = src0_mmq_conv.get();
+        type_src0_mmq = GGML_TYPE_BLAQ_Q4_256;
+        s01_mmq = nblocks_per_row_conv;
+        s02_mmq = ne01 * s01_mmq;
+        s03_mmq = ne02 * s02_mmq;
+    }
+
     const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);
 
@@ -135,11 +288,11 @@ void ggml_cuda_mul_mat_q(
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), type_src0_mmq, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), type_src0_mmq, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -154,10 +307,10 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
-            ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
-            ne03, ne13, s03, s13, s3,
+            src0_mmq_d, type_src0_mmq, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            ne00, ne01, ne1, s01_mmq, ne11, s1,
+            ne02, ne12, s02_mmq, s12, s2,
+            ne03, ne13, s03_mmq, s13, s3,
             use_stream_k, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
@@ -199,10 +352,10 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
 
         if (use_native_mxfp4) {
-            quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type_src0_mmq, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type_src0_mmq, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -214,10 +367,10 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
-        ne03, ne13, s03, s13, s3,
+        src0_mmq_d, type_src0_mmq, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        ne00, ne01, ne_get_rows, s01_mmq, ne_get_rows, s1,
+        ne02, ne02, s02_mmq, s12, s2,
+        ne03, ne13, s03_mmq, s13, s3,
         use_stream_k, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
@@ -238,7 +391,7 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t ne0 = dst->ne[0];
 
     const int64_t row_diff = row_high - row_low;
-    const int64_t stride01 = ne00 / ggml_blck_size(src0->type);
+    int64_t stride01 = ne00 / ggml_blck_size(src0->type);
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -250,11 +403,43 @@ void ggml_cuda_op_mul_mat_q(
     // The stream-k decomposition is only faster for recent NVIDIA GPUs.
     // Also its fixup needs to allocate a temporary buffer in the memory pool.
     // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
+    ggml_type type_src0_mmq = src0->type;
+    const char * src0_dd_i_mmq = src0_dd_i;
+    ggml_cuda_pool_alloc<char> src0_mmq_conv(ctx.pool());
+
+    if (src0->type == GGML_TYPE_BLAQ_RD_Q4_CL64) {
+        GGML_ASSERT(ne00 % QK_BLAQ_RD_CL64 == 0);
+
+        const int64_t nblocks_per_row_conv = ne00 / QK_BLAQ_128;
+        const size_t nbytes_src0_conv = row_diff * nblocks_per_row_conv * sizeof(block_blaq_q4_128);
+        src0_mmq_conv.alloc(nbytes_src0_conv);
+
+        convert_blaq_rd_q4_cl64_to_blaq_q4_128_cuda(src0_dd_i, src0_mmq_conv.get(), ne00, row_diff, 1, 1, stride01, 0, 0, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_dd_i_mmq = src0_mmq_conv.get();
+        type_src0_mmq = GGML_TYPE_BLAQ_Q4_128;
+        stride01 = nblocks_per_row_conv;
+    } else if (src0->type == GGML_TYPE_BLAQ_RD_Q4_CL128) {
+        GGML_ASSERT(ne00 % QK_BLAQ_RD_CL128 == 0);
+
+        const int64_t nblocks_per_row_conv = ne00 / QK_BLAQ_256;
+        const size_t nbytes_src0_conv = row_diff * nblocks_per_row_conv * sizeof(block_blaq_q4_256);
+        src0_mmq_conv.alloc(nbytes_src0_conv);
+
+        convert_blaq_rd_q4_cl128_to_blaq_q4_256_cuda(src0_dd_i, src0_mmq_conv.get(), ne00, row_diff, 1, 1, stride01, 0, 0, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_dd_i_mmq = src0_mmq_conv.get();
+        type_src0_mmq = GGML_TYPE_BLAQ_Q4_256;
+        stride01 = nblocks_per_row_conv;
+    }
+
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
     const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        src0_dd_i_mmq, type_src0_mmq, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
@@ -294,6 +479,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_BLAQ_Q4_128:
         case GGML_TYPE_BLAQ_Q4_256:
+        case GGML_TYPE_BLAQ_RD_Q4_CL64:
+        case GGML_TYPE_BLAQ_RD_Q4_CL128:
             mmq_supported = true;
             break;
         default:

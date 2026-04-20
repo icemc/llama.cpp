@@ -93,6 +93,34 @@ static __device__ __forceinline__ void dequantize_blaq_q4_256(const void * vx, c
     v.y *= d;
 }
 
+static __device__ __forceinline__ void dequantize_blaq_rd_q4_cl64(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_blaq_rd_q4_cl64 * x = (const block_blaq_rd_q4_cl64 *) vx;
+
+    const float d = __half2float(x[ib].d);
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = (vui & 0xF) - 8.0f;
+    v.y = (vui >>  4) - 8.0f;
+
+    v.x *= d;
+    v.y *= d;
+}
+
+static __device__ __forceinline__ void dequantize_blaq_rd_q4_cl128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_blaq_rd_q4_cl128 * x = (const block_blaq_rd_q4_cl128 *) vx;
+
+    const float d = __half2float(x[ib].d);
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = (vui & 0xF) - 8.0f;
+    v.y = (vui >>  4) - 8.0f;
+
+    v.x *= d;
+    v.y *= d;
+}
+
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 

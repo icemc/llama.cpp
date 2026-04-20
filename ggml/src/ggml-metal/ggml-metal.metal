@@ -197,6 +197,36 @@ void dequantize_blaq_q4_256_t4(device const block_blaq_q4_256 * xb, short il, th
     }
 }
 
+template <typename type4>
+void dequantize_blaq_rd_q4_cl64_t4(device const block_blaq_rd_q4_cl64 * xb, short il, thread type4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(xb->qs);
+    const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * xb->d;
+    const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    for (int i = 0; i < 2; i++) {
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
+    }
+}
+
+template <typename type4>
+void dequantize_blaq_rd_q4_cl128_t4(device const block_blaq_rd_q4_cl128 * xb, short il, thread type4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(xb->qs);
+    const float d1 = (il%2) ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * xb->d;
+    const ushort mask0 = (il%2) ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    for (int i = 0; i < 2; i++) {
+        reg[2*i + 0] = d1 * (qs[2*(il/2) + i] & mask0) + md;
+        reg[2*i + 1] = d2 * (qs[2*(il/2) + i] & mask1) + md;
+    }
+}
+
 // BLAQ mul_mm dequantize (4x4 — 16 weights per call, for kernel_mul_mm).
 // il: 0..7 for Q4_128 (NL=8), 0..15 for Q4_256 (NL=16).
 // For il=k: produces weights [16k..16k+15] from groups 2k and 2k+1.
@@ -237,6 +267,68 @@ void dequantize_blaq_q4_128(device const block_blaq_q4_128 * xb, short il, threa
 
 template <typename type4x4>
 void dequantize_blaq_q4_256(device const block_blaq_q4_256 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(xb->qs);
+    const float d  = (float)xb->d;
+    const float md = -8.0f * d;
+    const float d1 = d;
+    const float d2 = d / 256.0f;
+    const float d3 = d / 16.0f;
+    const float d4 = d / 4096.0f;
+    const short b  = 4 * il;
+
+    float4x4 reg_f;
+    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + md;
+    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + md;
+    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + md;
+    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + md;
+    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + md;
+    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + md;
+    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + md;
+    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + md;
+    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + md;
+    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + md;
+    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + md;
+    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + md;
+    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + md;
+    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + md;
+    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + md;
+    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + md;
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_blaq_rd_q4_cl64(device const block_blaq_rd_q4_cl64 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = (device const uint16_t *)(xb->qs);
+    const float d  = (float)xb->d;
+    const float md = -8.0f * d;
+    const float d1 = d;
+    const float d2 = d / 256.0f;
+    const float d3 = d / 16.0f;
+    const float d4 = d / 4096.0f;
+    const short b  = 4 * il;
+
+    float4x4 reg_f;
+    reg_f[0][0] = d1 * (float)(qs[b+0] & 0x000F) + md;
+    reg_f[0][1] = d2 * (float)(qs[b+0] & 0x0F00) + md;
+    reg_f[0][2] = d1 * (float)(qs[b+1] & 0x000F) + md;
+    reg_f[0][3] = d2 * (float)(qs[b+1] & 0x0F00) + md;
+    reg_f[1][0] = d3 * (float)(qs[b+0] & 0x00F0) + md;
+    reg_f[1][1] = d4 * (float)(qs[b+0] & 0xF000) + md;
+    reg_f[1][2] = d3 * (float)(qs[b+1] & 0x00F0) + md;
+    reg_f[1][3] = d4 * (float)(qs[b+1] & 0xF000) + md;
+    reg_f[2][0] = d1 * (float)(qs[b+2] & 0x000F) + md;
+    reg_f[2][1] = d2 * (float)(qs[b+2] & 0x0F00) + md;
+    reg_f[2][2] = d1 * (float)(qs[b+3] & 0x000F) + md;
+    reg_f[2][3] = d2 * (float)(qs[b+3] & 0x0F00) + md;
+    reg_f[3][0] = d3 * (float)(qs[b+2] & 0x00F0) + md;
+    reg_f[3][1] = d4 * (float)(qs[b+2] & 0xF000) + md;
+    reg_f[3][2] = d3 * (float)(qs[b+3] & 0x00F0) + md;
+    reg_f[3][3] = d4 * (float)(qs[b+3] & 0xF000) + md;
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_blaq_rd_q4_cl128(device const block_blaq_rd_q4_cl128 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = (device const uint16_t *)(xb->qs);
     const float d  = (float)xb->d;
     const float md = -8.0f * d;
@@ -3778,6 +3870,100 @@ kernel void kernel_mul_mv_blaq_q4_256_f32(
     kernel_mul_mv_blaq_q4_256_f32_impl<N_R0_BLAQ_Q4_256, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+template<typename block_q_rd_type, int QK_RD, short NR0, typename args_t>
+void kernel_mul_mv_blaq_rd_q4_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+
+    const int nb = args.ne00 / QK_RD;
+
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q_rd_type * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_q_rd_type *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const int ib0 = sgitg;
+    device const float * yb = y + ib0*QK_RD;
+
+    for (int ib = ib0; ib < nb; ib += NSG) {
+        for (int c = tiisg; c < QK_RD/16; c += NW) {
+            float yl[16];
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                yl[i] = yb[c*16 + i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const uint8_t * qs = ax[row][ib].qs + c*8;
+                const float d = ax[row][ib].d;
+
+                float sumq = 0.f;
+                FOR_UNROLL (short g = 0; g < 2; ++g) {
+                    FOR_UNROLL (short k = 0; k < 4; ++k) {
+                        const float w0 = (float)((int)(qs[4*g + k] & 0x0F) - 8);
+                        const float w1 = (float)((int)(qs[4*g + k] >>  4)  - 8);
+                        sumq += w0 * yl[8*g + k] + w1 * yl[8*g + k + 4];
+                    }
+                }
+
+                sumf[row] += sumq * d;
+            }
+        }
+
+        yb += NSG*QK_RD;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_blaq_rd_q4_cl64_f32")]]
+kernel void kernel_mul_mv_blaq_rd_q4_cl64_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_blaq_rd_q4_f32_impl<block_blaq_rd_q4_cl64, QK_BLAQ_RD_CL64, N_R0_BLAQ_RD_Q4_CL64, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_blaq_rd_q4_cl128_f32")]]
+kernel void kernel_mul_mv_blaq_rd_q4_cl128_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_blaq_rd_q4_f32_impl<block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, N_R0_BLAQ_RD_Q4_CL128, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
@@ -4078,6 +4264,16 @@ template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_2")]] kernel mul_mv_e
 template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
 template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
 template [[host_name("kernel_mul_mv_ext_blaq_q4_256_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_q4_256, 256, dequantize_blaq_q4_256_t4>;
+
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl64_f32_r1_2")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_rd_q4_cl64,  QK_BLAQ_RD_CL64,  dequantize_blaq_rd_q4_cl64_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl64_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_rd_q4_cl64,  QK_BLAQ_RD_CL64,  dequantize_blaq_rd_q4_cl64_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl64_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_rd_q4_cl64,  QK_BLAQ_RD_CL64,  dequantize_blaq_rd_q4_cl64_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl64_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_rd_q4_cl64,  QK_BLAQ_RD_CL64,  dequantize_blaq_rd_q4_cl64_t4>;
+
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl128_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, dequantize_blaq_rd_q4_cl128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl128_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, dequantize_blaq_rd_q4_cl128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl128_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, dequantize_blaq_rd_q4_cl128_t4>;
+template [[host_name("kernel_mul_mv_ext_blaq_rd_q4_cl128_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, dequantize_blaq_rd_q4_cl128_t4>;
 
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
@@ -10180,6 +10376,8 @@ template [[host_name("kernel_mul_mm_iq4_nl_f32")]]      kernel mul_mm_t kernel_m
 template [[host_name("kernel_mul_mm_iq4_xs_f32")]]      kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq4_xs,      QK_NL, dequantize_iq4_xs,      float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_blaq_q4_128_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_q4_128,  8,  dequantize_blaq_q4_128, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_blaq_q4_256_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_q4_256, 16,  dequantize_blaq_q4_256, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_blaq_rd_q4_cl64_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl64,  56, dequantize_blaq_rd_q4_cl64,  float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_blaq_rd_q4_cl128_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl128, 112, dequantize_blaq_rd_q4_cl128, float, float4x4, float, float2x4>;
 
 template [[host_name("kernel_mul_mm_f32_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_f16_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
@@ -10205,6 +10403,8 @@ template [[host_name("kernel_mul_mm_iq4_nl_f16")]]      kernel mul_mm_t kernel_m
 template [[host_name("kernel_mul_mm_iq4_xs_f16")]]      kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq4_xs,      QK_NL, dequantize_iq4_xs,      float, float4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_blaq_q4_128_f16")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_q4_128,  8,  dequantize_blaq_q4_128, float, float4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_blaq_q4_256_f16")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_q4_256, 16,  dequantize_blaq_q4_256, float, float4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_blaq_rd_q4_cl64_f16")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl64,  56, dequantize_blaq_rd_q4_cl64,  float, float4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_blaq_rd_q4_cl128_f16")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl128, 112, dequantize_blaq_rd_q4_cl128, float, float4x4, half, half2x4>;
 
 //
 // indirect matrix-matrix multiplication
@@ -10237,6 +10437,8 @@ template [[host_name("kernel_mul_mm_id_iq1_s_f32")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq1_m_f32")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_nl_f32")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f32")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_id_blaq_rd_q4_cl64_f32")]]  kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl64,  56, dequantize_blaq_rd_q4_cl64,  float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_blaq_rd_q4_cl128_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl128, 112, dequantize_blaq_rd_q4_cl128, float, float4x4, float, float2x4>;
 
 template [[host_name("kernel_mul_mm_id_f32_f16")]]     kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_f16_f16")]]     kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
@@ -10260,6 +10462,8 @@ template [[host_name("kernel_mul_mm_id_iq1_s_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq1_m_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_id_blaq_rd_q4_cl64_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl64,  56, dequantize_blaq_rd_q4_cl64,  float, float4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_blaq_rd_q4_cl128_f16")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_blaq_rd_q4_cl128, 112, dequantize_blaq_rd_q4_cl128, float, float4x4, half, half2x4>;
 
 //
 // matrix-vector multiplication
@@ -10403,6 +10607,8 @@ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t
 
 template [[host_name("kernel_mul_mv_id_blaq_q4_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_q4_128_f32_impl<N_R0_BLAQ_Q4_128>>>;
 template [[host_name("kernel_mul_mv_id_blaq_q4_256_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_q4_256_f32_impl<N_R0_BLAQ_Q4_256>>>;
+template [[host_name("kernel_mul_mv_id_blaq_rd_q4_cl64_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_rd_q4_f32_impl<block_blaq_rd_q4_cl64,  QK_BLAQ_RD_CL64,  N_R0_BLAQ_RD_Q4_CL64>>>;
+template [[host_name("kernel_mul_mv_id_blaq_rd_q4_cl128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_blaq_rd_q4_f32_impl<block_blaq_rd_q4_cl128, QK_BLAQ_RD_CL128, N_R0_BLAQ_RD_Q4_CL128>>>;
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
