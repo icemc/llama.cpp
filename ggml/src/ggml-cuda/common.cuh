@@ -1074,6 +1074,24 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+// C-Quant types: treat each 32-weight group as the "nibble granularity".
+// qk  = super-block size (weights per block).
+// qi  = nibble bytes / sizeof(int32) = qk/8  (qr=2, so nibble bytes = qk/2).
+// vdr = 4 for Q4_C_64 (one group per call), 8 for Q4_C_128 (two groups).
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_C_64> {
+    static constexpr int qk = QK_C_64;               // 1024
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_C_64 / (4 * 2);     // 128
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_C_128> {
+    static constexpr int qk = QK_C_128;              // 2048
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_C_128 / (4 * 2);   // 256
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
