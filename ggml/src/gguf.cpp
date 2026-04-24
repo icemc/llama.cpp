@@ -1271,6 +1271,31 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
     }
 }
 
+void gguf_set_tensor_ne(struct gguf_context * ctx, const char * name, int dim, int64_t ne) {
+    const int64_t tensor_id = gguf_find_tensor(ctx, name);
+    if (tensor_id < 0) {
+        GGML_ABORT("tensor not found: %s", name);
+    }
+    GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+
+    struct ggml_tensor * tensor = &ctx->info[tensor_id].t;
+    tensor->ne[dim] = ne;
+
+    const size_t  type_size = ggml_type_size(tensor->type);
+    const int64_t blck_size = ggml_blck_size(tensor->type);
+    tensor->nb[0] = type_size;
+    tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / blck_size);
+    for (int i = 2; i < GGML_MAX_DIMS; i++) {
+        tensor->nb[i] = tensor->nb[i - 1] * tensor->ne[i - 1];
+    }
+
+    // update offsets of all subsequent tensors
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+    for (int64_t i = tensor_id + 1; i < n_tensors; ++i) {
+        ctx->info[i].offset = ctx->info[i - 1].offset + GGML_PAD(ggml_nbytes(&ctx->info[i - 1].t), ctx->alignment);
+    }
+}
+
 void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const void * data) {
     const int64_t tensor_id = gguf_find_tensor(ctx, name);
     if (tensor_id < 0) {

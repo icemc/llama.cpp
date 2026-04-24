@@ -159,6 +159,10 @@ extern "C" {
     //   in such a way that the tensor data remains as one contiguous block (except for padding)
     GGML_API void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggml_type type);
 
+    // update a single dimension of a tensor's shape; recalculates strides and offsets of all subsequent tensors
+    // must be called before gguf_set_tensor_type when changing ne[0] to a padded value for block alignment
+    GGML_API void gguf_set_tensor_ne(struct gguf_context * ctx, const char * name, int dim, int64_t ne);
+
     // assumes that at least gguf_get_tensor_size bytes can be read from data
     GGML_API void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const void * data);
 
