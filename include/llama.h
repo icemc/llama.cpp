@@ -156,6 +156,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
 
+        // C-Quant: Cache-Line-Aware NF4 Quantization (BLAQ-UAP)
+        LLAMA_FTYPE_MOSTLY_Q4_C_64       = 41, // 5.0 bpw, NF4+AWQ, 64-byte cache lines
+        LLAMA_FTYPE_MOSTLY_Q4_C_128      = 42, // 5.0 bpw, NF4+AWQ, 128-byte cache lines
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 

@@ -715,6 +715,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         const char * name = gguf_get_key(ctx, i);
         const std::string value = gguf_kv_to_str(ctx, i);
         gguf_kv.emplace(name, value);
+        // C-Quant zero-padding: collect original unpadded column counts
+        static constexpr char cquant_prefix[] = "cquant.orig_ncols.";
+        if (strncmp(name, cquant_prefix, sizeof(cquant_prefix) - 1) == 0 && type == GGUF_TYPE_UINT32) {
+            cquant_orig_ncols[name + sizeof(cquant_prefix) - 1] = gguf_get_val_u32(ctx, i);
+        }
     }
 
     // get general kv

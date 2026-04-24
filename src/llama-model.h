@@ -562,6 +562,9 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // C-Quant zero-padding: original unpadded column count per tensor name
+    std::unordered_map<std::string, uint32_t> cquant_orig_ncols;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

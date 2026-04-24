@@ -970,6 +970,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // C-Quant: if w was zero-padded during quantization, extend cur's dim-0 to match
+    if ((w->type == GGML_TYPE_Q4_C_64 || w->type == GGML_TYPE_Q4_C_128) &&
+            cur->ne[0] != w->ne[0]) {
+        cur = ggml_pad(ctx0, cur, w->ne[0] - cur->ne[0], 0, 0, 0);
+    }
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
@@ -1001,6 +1006,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
+    // C-Quant: if w was zero-padded during quantization, extend cur's dim-0 to match
+    if ((w->type == GGML_TYPE_Q4_C_64 || w->type == GGML_TYPE_Q4_C_128) &&
+            cur->ne[0] != w->ne[0]) {
+        cur = ggml_pad(ctx0, cur, w->ne[0] - cur->ne[0], 0, 0, 0);
+    }
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
