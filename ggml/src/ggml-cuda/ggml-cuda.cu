@@ -27,6 +27,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-q4c.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2451,6 +2452,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && is_cquant && !bad_padding_clear
+               && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+               && src1->ne[1] > MMVQ_MAX_BATCH_SIZE
+               && src1->ne[2] == 1 && src1->ne[3] == 1) {
+        // Standalone tiled GEMM for Q4_C PP (avoids dequant-to-FP16 + cuBLAS overhead)
+        // TEMPORARILY DISABLED to measure cuBLAS baseline — re-enable after measurement
+        //ggml_cuda_mul_mat_q4_C_f32(ctx, src0, src1, dst);
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)

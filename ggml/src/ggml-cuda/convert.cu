@@ -714,25 +714,28 @@ static __device__ const float nf4_codebook_dev[16] = {
 template<typename dst_t>
 static __global__ void dequantize_block_q4_C_64(const void * __restrict__ vx,
                                                   dst_t * __restrict__ y, int64_t k) {
+    // Load 64-byte codebook into shared memory once per block; all threads reuse it.
+    // __syncthreads() must be reached by all threads — early-return guard comes after.
+    __shared__ float codebook[16];
+    if (threadIdx.x < 16) codebook[threadIdx.x] = nf4_codebook_dev[threadIdx.x];
+    __syncthreads();
+
     const int64_t idx = (int64_t)blockIdx.x * CUDA_DEQUANTIZE_BLOCK_SIZE + threadIdx.x;
     if (idx >= k / 2) return;
 
     const block_q4_C_64 * x = (const block_q4_C_64 *)vx;
     const int n_pairs = QK_C_64 / 2;              // = 512 pairs per super-block
-    const int sb  = (int)(idx / n_pairs);         // super-block index
-    const int off = (int)(idx % n_pairs);         // nibble-pair offset within super-block
-    const int g   = off / (QK_UAP_G / 2);        // group index (0..31)
-    const int j   = off % (QK_UAP_G / 2);        // nibble index within group (0..15)
+    const int sb  = (int)(idx >> 9);              // idx / 512
+    const int off = (int)(idx & 511);             // idx % 512
+    const int g   = off >> 4;                     // off / 16
+    const int j   = off & 15;                     // off % 16
 
-    const float d     = __half2float(x[sb].d[g]);
-    const float s_g   = __half2float(x[sb].s[g]);
-    const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
-    const float ds    = d * inv_s;
+    const float d_eff  = __half2float(x[sb].d[g]);
 
     const uint8_t byte = x[sb].qs[g * (QK_UAP_G / 2) + j];
     const int64_t out  = (int64_t)sb * QK_C_64 + g * QK_UAP_G + j * 2;
-    y[out + 0] = (dst_t)(ds * nf4_codebook_dev[byte & 0x0F]);
-    y[out + 1] = (dst_t)(ds * nf4_codebook_dev[byte >> 4]);
+    y[out + 0] = (dst_t)(d_eff * codebook[byte & 0x0F]);
+    y[out + 1] = (dst_t)(d_eff * codebook[byte >> 4]);
 }
 
 template<typename dst_t>
@@ -746,25 +749,26 @@ static void dequantize_row_q4_C_64_cuda(const void * vx, dst_t * y, const int64_
 template<typename dst_t>
 static __global__ void dequantize_block_q4_C_128(const void * __restrict__ vx,
                                                    dst_t * __restrict__ y, int64_t k) {
+    __shared__ float codebook[16];
+    if (threadIdx.x < 16) codebook[threadIdx.x] = nf4_codebook_dev[threadIdx.x];
+    __syncthreads();
+
     const int64_t idx = (int64_t)blockIdx.x * CUDA_DEQUANTIZE_BLOCK_SIZE + threadIdx.x;
     if (idx >= k / 2) return;
 
     const block_q4_C_128 * x = (const block_q4_C_128 *)vx;
-    const int n_pairs = QK_C_128 / 2;
-    const int sb  = (int)(idx / n_pairs);
-    const int off = (int)(idx % n_pairs);
-    const int g   = off / (QK_UAP_G / 2);
-    const int j   = off % (QK_UAP_G / 2);
+    const int n_pairs = QK_C_128 / 2;             // = 1024
+    const int sb  = (int)(idx >> 10);             // idx / 1024
+    const int off = (int)(idx & 1023);            // idx % 1024
+    const int g   = off >> 4;                     // off / 16
+    const int j   = off & 15;                     // off % 16
 
-    const float d     = __half2float(x[sb].d[g]);
-    const float s_g   = __half2float(x[sb].s[g]);
-    const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
-    const float ds    = d * inv_s;
+    const float d_eff  = __half2float(x[sb].d[g]);
 
     const uint8_t byte = x[sb].qs[g * (QK_UAP_G / 2) + j];
     const int64_t out  = (int64_t)sb * QK_C_128 + g * QK_UAP_G + j * 2;
-    y[out + 0] = (dst_t)(ds * nf4_codebook_dev[byte & 0x0F]);
-    y[out + 1] = (dst_t)(ds * nf4_codebook_dev[byte >> 4]);
+    y[out + 0] = (dst_t)(d_eff * codebook[byte & 0x0F]);
+    y[out + 1] = (dst_t)(d_eff * codebook[byte >> 4]);
 }
 
 template<typename dst_t>

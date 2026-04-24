@@ -5565,8 +5565,7 @@ void quantize_row_q4_C_64_ref(const float * GGML_RESTRICT x,
             const float * gsrc = src + g * QK_UAP_G;
             float amax = 0.f;
             for (int j = 0; j < QK_UAP_G; ++j) amax = fmaxf(amax, fabsf(gsrc[j]));
-            y[i].d[g] = GGML_FP32_TO_FP16(amax);
-            y[i].s[g] = GGML_FP32_TO_FP16(1.0f);
+            y[i].d[g] = GGML_FP32_TO_FP16(amax);  // s_g=1 → d_eff = amax
             if (amax == 0.f) continue;
             float id = 1.f / amax;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
@@ -5586,14 +5585,12 @@ void dequantize_row_q4_C_64(const block_q4_C_64 * GGML_RESTRICT x,
 
     for (int64_t i = 0; i < nb; ++i) {
         for (int g = 0; g < n_groups; ++g) {
-            const float d     = GGML_FP16_TO_FP32(x[i].d[g]);
-            const float s_g   = GGML_FP16_TO_FP32(x[i].s[g]);
-            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float d_eff  = GGML_FP16_TO_FP32(x[i].d[g]);
             const uint8_t * qs = x[i].qs + g * (QK_UAP_G / 2);
             float * out = y + i * QK_C_64 + g * QK_UAP_G;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
-                out[2*j]     = d * NF4_CODEBOOK[qs[j] & 0x0F] * inv_s;
-                out[2*j + 1] = d * NF4_CODEBOOK[qs[j] >> 4]   * inv_s;
+                out[2*j]     = d_eff * NF4_CODEBOOK[qs[j] & 0x0F];
+                out[2*j + 1] = d_eff * NF4_CODEBOOK[qs[j] >> 4];
             }
         }
     }
@@ -5621,7 +5618,6 @@ static void quantize_row_q4_C_64_impl(const float * GGML_RESTRICT x,
             const float * im   = imatrix ? imatrix + i * QK_C_64 + g * QK_UAP_G : NULL;
 
             float s_g = compute_awq_group_scale(im, QK_UAP_G, imax, 0.25f);
-            y[i].s[g] = GGML_FP32_TO_FP16(s_g);
 
             float scaled[QK_UAP_G];
             for (int j = 0; j < QK_UAP_G; ++j) scaled[j] = gsrc[j] * s_g;
@@ -5632,7 +5628,9 @@ static void quantize_row_q4_C_64_impl(const float * GGML_RESTRICT x,
 
             float d = im ? nf4_find_scale_gs(scaled, im, QK_UAP_G, amax / 15.f, amax)
                          : amax;
-            y[i].d[g] = GGML_FP32_TO_FP16(d);
+            // Store fused effective scale: d_eff = d / s_g
+            // Dequant just multiplies NF4[code] × d_eff — no per-element AWQ division needed.
+            y[i].d[g] = GGML_FP32_TO_FP16(d / fmaxf(s_g, 1e-9f));
             float id = 1.f / d;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
                 int lo = nf4_quantize_scalar(scaled[2*j]     * id);
@@ -5676,8 +5674,7 @@ void quantize_row_q4_C_128_ref(const float * GGML_RESTRICT x,
             const float * gsrc = src + g * QK_UAP_G;
             float amax = 0.f;
             for (int j = 0; j < QK_UAP_G; ++j) amax = fmaxf(amax, fabsf(gsrc[j]));
-            y[i].d[g] = GGML_FP32_TO_FP16(amax);
-            y[i].s[g] = GGML_FP32_TO_FP16(1.0f);
+            y[i].d[g] = GGML_FP32_TO_FP16(amax);  // s_g=1 → d_eff = amax
             if (amax == 0.f) continue;
             float id = 1.f / amax;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
@@ -5697,14 +5694,12 @@ void dequantize_row_q4_C_128(const block_q4_C_128 * GGML_RESTRICT x,
 
     for (int64_t i = 0; i < nb; ++i) {
         for (int g = 0; g < n_groups; ++g) {
-            const float d     = GGML_FP16_TO_FP32(x[i].d[g]);
-            const float s_g   = GGML_FP16_TO_FP32(x[i].s[g]);
-            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float d_eff  = GGML_FP16_TO_FP32(x[i].d[g]);
             const uint8_t * qs = x[i].qs + g * (QK_UAP_G / 2);
             float * out = y + i * QK_C_128 + g * QK_UAP_G;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
-                out[2*j]     = d * NF4_CODEBOOK[qs[j] & 0x0F] * inv_s;
-                out[2*j + 1] = d * NF4_CODEBOOK[qs[j] >> 4]   * inv_s;
+                out[2*j]     = d_eff * NF4_CODEBOOK[qs[j] & 0x0F];
+                out[2*j + 1] = d_eff * NF4_CODEBOOK[qs[j] >> 4];
             }
         }
     }
@@ -5732,7 +5727,6 @@ static void quantize_row_q4_C_128_impl(const float * GGML_RESTRICT x,
             const float * im   = imatrix ? imatrix + i * QK_C_128 + g * QK_UAP_G : NULL;
 
             float s_g = compute_awq_group_scale(im, QK_UAP_G, imax, 0.25f);
-            y[i].s[g] = GGML_FP32_TO_FP16(s_g);
 
             float scaled[QK_UAP_G];
             for (int j = 0; j < QK_UAP_G; ++j) scaled[j] = gsrc[j] * s_g;
@@ -5743,7 +5737,7 @@ static void quantize_row_q4_C_128_impl(const float * GGML_RESTRICT x,
 
             float d = im ? nf4_find_scale_gs(scaled, im, QK_UAP_G, amax / 15.f, amax)
                          : amax;
-            y[i].d[g] = GGML_FP32_TO_FP16(d);
+            y[i].d[g] = GGML_FP32_TO_FP16(d / fmaxf(s_g, 1e-9f));
             float id = 1.f / d;
             for (int j = 0; j < QK_UAP_G / 2; ++j) {
                 int lo = nf4_quantize_scalar(scaled[2*j]     * id);

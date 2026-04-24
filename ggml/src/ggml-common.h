@@ -285,25 +285,23 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 
 // Q4_C_64: 64-byte cache-line target (x86, ARM Neoverse V3, GB10)
 // 32 groups × 32 weights = 1024 weights/super-block
-// 64 B NF4 scales + 64 B AWQ scales + 512 B weights = 640 B = 10 × 64 B → 5.0 bpw
+// 64 B fused scales (d/s_g pre-computed) + 512 B weights = 576 B = 9 × 64 B → 4.5 bpw
 #define QK_C_64   1024
 typedef struct {
-    ggml_half d[32];        //  64 B — NF4 group scales  (cache line 0)
-    ggml_half s[32];        //  64 B — AWQ group scales  (cache line 1)
-    uint8_t   qs[512];      // 512 B — 4-bit nibbles     (cache lines 2–9)
-} block_q4_C_64;            // 640 B = 10 × 64 B  (also 5 × 128 B)
-static_assert(sizeof(block_q4_C_64) == 640, "wrong block_q4_C_64 size");
+    ggml_half d[32];        //  64 B — fused NF4+AWQ scales (d/s_g, cache line 0)
+    uint8_t   qs[512];      // 512 B — 4-bit nibbles        (cache lines 1–8)
+} block_q4_C_64;            // 576 B = 9 × 64 B  (also 4.5 × 128 B)
+static_assert(sizeof(block_q4_C_64) == 576, "wrong block_q4_C_64 size");
 
 // Q4_C_128: 128-byte cache-line target (Apple M-series)
 // 64 groups × 32 weights = 2048 weights/super-block
-// 128 B NF4 scales + 128 B AWQ scales + 1024 B weights = 1280 B = 10 × 128 B → 5.0 bpw
+// 128 B fused scales (d/s_g pre-computed) + 1024 B weights = 1152 B = 9 × 128 B → 4.5 bpw
 #define QK_C_128  2048
 typedef struct {
-    ggml_half d[64];        // 128 B — NF4 group scales  (cache line 0)
-    ggml_half s[64];        // 128 B — AWQ group scales  (cache line 1)
-    uint8_t   qs[1024];     //1024 B — 4-bit nibbles     (cache lines 2–9)
-} block_q4_C_128;           //1280 B = 10 × 128 B (also 20 × 64 B)
-static_assert(sizeof(block_q4_C_128) == 1280, "wrong block_q4_C_128 size");
+    ggml_half d[64];        // 128 B — fused NF4+AWQ scales (d/s_g, cache line 0)
+    uint8_t   qs[1024];     //1024 B — 4-bit nibbles        (cache lines 1–8)
+} block_q4_C_128;           //1152 B = 9 × 128 B (also 18 × 64 B)
+static_assert(sizeof(block_q4_C_128) == 1152, "wrong block_q4_C_128 size");
 
 //
 // Super-block quantization structures

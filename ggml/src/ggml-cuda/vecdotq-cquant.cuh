@@ -39,10 +39,7 @@ static __device__ __forceinline__ float vec_dot_q4_C_64_q8_1(
     // Group index: 4 int32s of nibbles per group (16 bytes, 32 nibbles).
     const int g = iqs >> 2;   // iqs / 4
 
-    // Effective dequant scale: (d / s_g) / 127  (int8 NF4 table is ×127)
-    const float d_eff = __half2float(blk->d[g])
-                      / (__half2float(blk->s[g]) > 1e-9f ? __half2float(blk->s[g]) : 1.0f)
-                      / 127.0f;
+    const float d_eff = __half2float(blk->d[g]) * (1.0f/127.0f);
     const float d8    = __low2float(bq8_1[g].ds);
 
     // Nibble bytes for group g: 16 bytes, read as 4 int32s.
@@ -92,9 +89,7 @@ static __device__ __forceinline__ float vec_dot_q4_C_128_q8_1(
     for (int gi = 0; gi < 2; ++gi) {
         const int g = g0 + gi;
 
-        const float d_eff = __half2float(blk->d[g])
-                          / (__half2float(blk->s[g]) > 1e-9f ? __half2float(blk->s[g]) : 1.0f)
-                          / 127.0f;
+        const float d_eff = __half2float(blk->d[g]) * (1.0f/127.0f);
         const float d8    = __low2float(bq8_1[g].ds);
 
         const uint8_t * g_qs = blk->qs + g * 16;

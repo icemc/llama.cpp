@@ -1318,11 +1318,9 @@ void ggml_vec_dot_q4_C_64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     float sumf = 0.f;
     for (int ib = 0; ib < nb; ++ib) {
         for (int g = 0; g < n_groups; ++g) {
-            const float d     = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
-            const float s_g   = GGML_CPU_FP16_TO_FP32(x[ib].s[g]);
-            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float d_eff = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
             const float dy    = GGML_CPU_FP16_TO_FP32(y[ib * n_groups + g].d);
-            const float scale = d * inv_s * dy;
+            const float scale = d_eff * dy;
             const uint8_t * qs  = x[ib].qs + g * (QK_UAP_G / 2);
             const int8_t  * yqs = y[ib * n_groups + g].qs;
             float sumi = 0.f;
@@ -1352,11 +1350,9 @@ void ggml_vec_dot_q4_C_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t b
     float sumf = 0.f;
     for (int ib = 0; ib < nb; ++ib) {
         for (int g = 0; g < n_groups; ++g) {
-            const float d     = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
-            const float s_g   = GGML_CPU_FP16_TO_FP32(x[ib].s[g]);
-            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float d_eff = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
             const float dy    = GGML_CPU_FP16_TO_FP32(y[ib * n_groups + g].d);
-            const float scale = d * inv_s * dy;
+            const float scale = d_eff * dy;
             const uint8_t * qs  = x[ib].qs + g * (QK_UAP_G / 2);
             const int8_t  * yqs = y[ib * n_groups + g].qs;
             float sumi = 0.f;
