@@ -347,3 +347,7 @@
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #endif
+
+// C-Quant has no arch-specific implementations — always use the generic scalar path.
+#define ggml_vec_dot_q4_C_64_q8_0_generic  ggml_vec_dot_q4_C_64_q8_0
+#define ggml_vec_dot_q4_C_128_q8_0_generic ggml_vec_dot_q4_C_128_q8_0

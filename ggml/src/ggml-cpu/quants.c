@@ -58,6 +58,14 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_q4_C_64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_C_64_ref(x, (block_q4_C_64 *)y, k);
+}
+
+void quantize_row_q4_C_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_C_128_ref(x, (block_q4_C_128 *)y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -1285,4 +1293,79 @@ void quantize_row_iq4_nl(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
+}
+
+// =============================================================================
+// C-Quant: Cache-Line-Aware NF4 Quantization (BLAQ-UAP)
+// Scalar vec_dot: 1 C-Quant super-block × (n_groups Q8_0 blocks)
+// =============================================================================
+
+#include "../nf4-codebook.h"
+
+// Q4_C_64: 1 super-block = 32 groups × 32 weights = 32 Q8_0 blocks on the RHS
+void ggml_vec_dot_q4_C_64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                        const void * GGML_RESTRICT vx, size_t bx,
+                                        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_C_64 == 0);
+
+    const block_q4_C_64 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb       = n / QK_C_64;
+    const int n_groups = QK_C_64 / QK_UAP_G;
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int g = 0; g < n_groups; ++g) {
+            const float d     = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
+            const float s_g   = GGML_CPU_FP16_TO_FP32(x[ib].s[g]);
+            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float dy    = GGML_CPU_FP16_TO_FP32(y[ib * n_groups + g].d);
+            const float scale = d * inv_s * dy;
+            const uint8_t * qs  = x[ib].qs + g * (QK_UAP_G / 2);
+            const int8_t  * yqs = y[ib * n_groups + g].qs;
+            float sumi = 0.f;
+            for (int j = 0; j < QK_UAP_G / 2; ++j) {
+                sumi += NF4_CODEBOOK[qs[j] & 0x0F] * (float)yqs[2*j];
+                sumi += NF4_CODEBOOK[qs[j] >> 4]   * (float)yqs[2*j + 1];
+            }
+            sumf += scale * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// Q4_C_128: 1 super-block = 64 groups × 32 weights = 64 Q8_0 blocks on the RHS
+void ggml_vec_dot_q4_C_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                         const void * GGML_RESTRICT vx, size_t bx,
+                                         const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_C_128 == 0);
+
+    const block_q4_C_128 * GGML_RESTRICT x = vx;
+    const block_q8_0     * GGML_RESTRICT y = vy;
+    const int nb       = n / QK_C_128;
+    const int n_groups = QK_C_128 / QK_UAP_G;
+
+    float sumf = 0.f;
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int g = 0; g < n_groups; ++g) {
+            const float d     = GGML_CPU_FP16_TO_FP32(x[ib].d[g]);
+            const float s_g   = GGML_CPU_FP16_TO_FP32(x[ib].s[g]);
+            const float inv_s = (s_g > 0.f) ? 1.f / s_g : 1.f;
+            const float dy    = GGML_CPU_FP16_TO_FP32(y[ib * n_groups + g].d);
+            const float scale = d * inv_s * dy;
+            const uint8_t * qs  = x[ib].qs + g * (QK_UAP_G / 2);
+            const int8_t  * yqs = y[ib * n_groups + g].qs;
+            float sumi = 0.f;
+            for (int j = 0; j < QK_UAP_G / 2; ++j) {
+                sumi += NF4_CODEBOOK[qs[j] & 0x0F] * (float)yqs[2*j];
+                sumi += NF4_CODEBOOK[qs[j] >> 4]   * (float)yqs[2*j + 1];
+            }
+            sumf += scale * sumi;
+        }
+    }
+    *s = sumf;
 }
