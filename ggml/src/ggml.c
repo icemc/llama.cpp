@@ -745,7 +745,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
     [GGML_TYPE_Q4_C_64] = {
-        .type_name                = "q4_c_64",
+        .type_name                = "q4_C_64",
         .blck_size                = QK_C_64,
         .type_size                = sizeof(block_q4_C_64),
         .is_quantized             = true,
@@ -753,7 +753,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_C_64_ref,
     },
     [GGML_TYPE_Q4_C_128] = {
-        .type_name                = "q4_c_128",
+        .type_name                = "q4_C_128",
         .blck_size                = QK_C_128,
         .type_size                = sizeof(block_q4_C_128),
         .is_quantized             = true,

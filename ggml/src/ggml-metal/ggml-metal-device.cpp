@@ -850,6 +850,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_IQ4_XS;
                 smem = 32*sizeof(float);
             } break;
+        case GGML_TYPE_Q4_C_64:
+            {
+                nsg  = N_SG_Q4_C_64;
+                nr0  = N_R0_Q4_C_64;
+                smem = 0;
+            } break;
+        case GGML_TYPE_Q4_C_128:
+            {
+                nsg  = N_SG_Q4_C_128;
+                nr0  = N_R0_Q4_C_128;
+                smem = 0;
+            } break;
         default:
             {
                 GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
