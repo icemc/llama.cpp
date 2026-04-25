@@ -2456,9 +2456,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
                && src1->ne[1] > MMVQ_MAX_BATCH_SIZE
                && src1->ne[2] == 1 && src1->ne[3] == 1) {
-        // Standalone tiled GEMM for Q4_C PP (avoids dequant-to-FP16 + cuBLAS overhead)
-        // TEMPORARILY DISABLED to measure cuBLAS baseline — re-enable after measurement
-        //ggml_cuda_mul_mat_q4_C_f32(ctx, src0, src1, dst);
+        // cuBLAS outperforms the custom GEMM on Tensor Core GPUs.
+        // The custom kernel (mmq-q4c.cuh) is kept for reference but not invoked here.
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
