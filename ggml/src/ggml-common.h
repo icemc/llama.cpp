@@ -283,25 +283,25 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 
 #define QK_UAP_G  32    // logical group size (weights per group scale)
 
-// Q4_C_64: 64-byte cache-line target (x86, ARM Neoverse V3, GB10)
-// 32 groups × 32 weights = 1024 weights/super-block
-// 64 B fused scales (d/s_g pre-computed) + 512 B weights = 576 B = 9 × 64 B → 4.5 bpw
-#define QK_C_64   1024
+// Q4_C_64: 4 groups × 32 weights = 128 weights/super-block
+// Weight section = 64 B (exactly one 64-byte cache line of payload)
+// 8 B scales + 64 B weights = 72 B total → 4.5 bpw
+#define QK_C_64   128
 typedef struct {
-    ggml_half d[32];        //  64 B — fused NF4+AWQ scales (d/s_g, cache line 0)
-    uint8_t   qs[512];      // 512 B — 4-bit nibbles        (cache lines 1–8)
-} block_q4_C_64;            // 576 B = 9 × 64 B  (also 4.5 × 128 B)
-static_assert(sizeof(block_q4_C_64) == 576, "wrong block_q4_C_64 size");
+    ggml_half d[4];         //   8 B — fused NF4+AWQ scales (4 groups)
+    uint8_t   qs[64];       //  64 B — 4-bit nibbles (one 64-byte cache line)
+} block_q4_C_64;            //  72 B total, 4.5 bpw
+static_assert(sizeof(block_q4_C_64) == 72, "wrong block_q4_C_64 size");
 
-// Q4_C_128: 128-byte cache-line target (Apple M-series)
-// 64 groups × 32 weights = 2048 weights/super-block
-// 128 B fused scales (d/s_g pre-computed) + 1024 B weights = 1152 B = 9 × 128 B → 4.5 bpw
-#define QK_C_128  2048
+// Q4_C_128: 8 groups × 32 weights = 256 weights/super-block
+// Weight section = 128 B (exactly one 128-byte cache line of payload)
+// 16 B scales + 128 B weights = 144 B total → 4.5 bpw
+#define QK_C_128  256
 typedef struct {
-    ggml_half d[64];        // 128 B — fused NF4+AWQ scales (d/s_g, cache line 0)
-    uint8_t   qs[1024];     //1024 B — 4-bit nibbles        (cache lines 1–8)
-} block_q4_C_128;           //1152 B = 9 × 128 B (also 18 × 64 B)
-static_assert(sizeof(block_q4_C_128) == 1152, "wrong block_q4_C_128 size");
+    ggml_half d[8];         //  16 B — fused NF4+AWQ scales (8 groups)
+    uint8_t   qs[128];      // 128 B — 4-bit nibbles (one 128-byte cache line)
+} block_q4_C_128;           // 144 B total, 4.5 bpw
+static_assert(sizeof(block_q4_C_128) == 144, "wrong block_q4_C_128 size");
 
 //
 // Super-block quantization structures

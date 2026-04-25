@@ -724,9 +724,9 @@ static __global__ void dequantize_block_q4_C_64(const void * __restrict__ vx,
     if (idx >= k / 2) return;
 
     const block_q4_C_64 * x = (const block_q4_C_64 *)vx;
-    const int n_pairs = QK_C_64 / 2;              // = 512 pairs per super-block
-    const int sb  = (int)(idx >> 9);              // idx / 512
-    const int off = (int)(idx & 511);             // idx % 512
+    const int n_pairs = QK_C_64 / 2;              // = 64 pairs per super-block
+    const int sb  = (int)(idx >> 6);              // idx / 64
+    const int off = (int)(idx & 63);              // idx % 64
     const int g   = off >> 4;                     // off / 16
     const int j   = off & 15;                     // off % 16
 
@@ -757,9 +757,9 @@ static __global__ void dequantize_block_q4_C_128(const void * __restrict__ vx,
     if (idx >= k / 2) return;
 
     const block_q4_C_128 * x = (const block_q4_C_128 *)vx;
-    const int n_pairs = QK_C_128 / 2;             // = 1024
-    const int sb  = (int)(idx >> 10);             // idx / 1024
-    const int off = (int)(idx & 1023);            // idx % 1024
+    const int n_pairs = QK_C_128 / 2;             // = 128
+    const int sb  = (int)(idx >> 7);              // idx / 128
+    const int off = (int)(idx & 127);             // idx % 128
     const int g   = off >> 4;                     // off / 16
     const int j   = off & 15;                     // off % 16
 

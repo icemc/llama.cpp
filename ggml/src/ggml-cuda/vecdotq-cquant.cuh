@@ -11,8 +11,8 @@ static __device__ const int8_t nf4_int8_table[16] = {
 };
 
 // VDR (vectors-per-dispatch-register) for MMVQ.
-// Q4_C_64:  qk=1024, qi=128, vdr=4  → qi/vdr=32 (one warp per super-block with nwarps=4 warps)
-// Q4_C_128: qk=2048, qi=256, vdr=8  → qi/vdr=32 (one warp per super-block; needs nwarps≥2)
+// Q4_C_64:  qk=128, qi=16, vdr=4  → qi/vdr=4  (4 calls cover all 4 groups per super-block)
+// Q4_C_128: qk=256, qi=32, vdr=8  → qi/vdr=4  (4 calls cover all 8 groups per super-block, 2 at a time)
 #define VDR_Q4_C_64_Q8_1_MMVQ  4
 #define VDR_Q4_C_128_Q8_1_MMVQ 8
 
