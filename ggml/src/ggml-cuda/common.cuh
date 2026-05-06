@@ -1092,6 +1092,24 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_C_128> {
     static constexpr int qi = QK_C_128 / (4 * 2);   // 256
 };
 
+// KCA types: same nibble layout (qi = nibble bytes / 4 = qk/8).
+// vdr = 8 → one sub-block pair (64 weights) per vec_dot call.
+// Q4_KCA_64: qi=128, qi/vdr=16 (2 super-blocks per warp)
+// Q4_KCA_128: qi=256, qi/vdr=32 (1 super-block per warp)
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_KCA_64> {
+    static constexpr int qk = QK_KCA_64;              // 1024
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_KCA_64 / (4 * 2);   // 128
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_KCA_128> {
+    static constexpr int qk = QK_KCA_128;             // 2048
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_KCA_128 / (4 * 2);  // 256
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
