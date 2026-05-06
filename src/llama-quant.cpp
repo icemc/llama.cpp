@@ -389,6 +389,8 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_Q4_C_64:
             case GGML_TYPE_Q4_C_128: return_type = GGML_TYPE_Q4_K;  break;
+            case GGML_TYPE_Q4_KCA_64:
+            case GGML_TYPE_Q4_KCA_128: return_type = GGML_TYPE_Q4_K; break;
             default:
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
@@ -810,6 +812,10 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_C_64:     return GGML_TYPE_Q4_C_64;
         case LLAMA_FTYPE_MOSTLY_Q4_C_128:    return GGML_TYPE_Q4_C_128;
 
+        // Q4_KCA
+        case LLAMA_FTYPE_MOSTLY_Q4_KCA_64:   return GGML_TYPE_Q4_KCA_64;
+        case LLAMA_FTYPE_MOSTLY_Q4_KCA_128:  return GGML_TYPE_Q4_KCA_128;
+
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
         case LLAMA_FTYPE_MOSTLY_Q2_K:    return GGML_TYPE_Q2_K;
@@ -1155,9 +1161,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
             if (quantize) {
-                // C-Quant: account for zero-padding to next block boundary
+                // C-Quant / Q4_KCA: account for zero-padding to next block boundary
                 int64_t ne0_eff = tensor->ne[0];
-                if (new_type == GGML_TYPE_Q4_C_64 || new_type == GGML_TYPE_Q4_C_128) {
+                if (new_type == GGML_TYPE_Q4_C_64 || new_type == GGML_TYPE_Q4_C_128 ||
+                    new_type == GGML_TYPE_Q4_KCA_64 || new_type == GGML_TYPE_Q4_KCA_128) {
                     const int64_t blck = ggml_blck_size(new_type);
                     ne0_eff = ((ne0_eff + blck - 1) / blck) * blck;
                 }
@@ -1238,11 +1245,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows     = tensor->ne[1];
 
-                // C-Quant zero-padding: extend rows to next multiple of block size when needed
+                // C-Quant / Q4_KCA zero-padding: extend rows to next multiple of block size when needed
                 int64_t n_per_row_eff = n_per_row;
                 std::vector<float> f32_padded_buf;
                 std::vector<float> imatrix_padded_buf;
-                if (new_type == GGML_TYPE_Q4_C_64 || new_type == GGML_TYPE_Q4_C_128) {
+                if (new_type == GGML_TYPE_Q4_C_64 || new_type == GGML_TYPE_Q4_C_128 ||
+                    new_type == GGML_TYPE_Q4_KCA_64 || new_type == GGML_TYPE_Q4_KCA_128) {
                     const int64_t blck = ggml_blck_size(new_type);
                     if (n_per_row % blck != 0) {
                         n_per_row_eff = ((n_per_row + blck - 1) / blck) * blck;

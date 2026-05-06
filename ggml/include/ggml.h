@@ -434,7 +434,11 @@ extern "C" {
         GGML_TYPE_Q4_C_64   = 42,  // 1024-weight super-block, 64-byte cache lines
         GGML_TYPE_Q4_C_128  = 43,  // 2048-weight super-block, 128-byte cache lines
 
-        GGML_TYPE_COUNT   = 44,
+        // Q4_KCA: Cache-Line-Aligned K-Quant (uniform nibbles, K-quant scale structure)
+        GGML_TYPE_Q4_KCA_64  = 44, // 576B = 9×64B, 1024 weights, x86 target
+        GGML_TYPE_Q4_KCA_128 = 45, // 1152B = 9×128B = 18×64B, 2048 weights, universal
+
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

@@ -72,8 +72,11 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     // Note: Ensure COPY comes after F32 to avoid ftype 0 from matching.
     { "COPY",     LLAMA_FTYPE_ALL_F32,         "only copy tensors, no quantizing",  },
     // C-Quant: Cache-Line-Aware NF4 Quantization (BLAQ-UAP)
-    { "Q4_C_64",  LLAMA_FTYPE_MOSTLY_Q4_C_64,  " 5.0 bpw, NF4+AWQ, 64B cache lines (x86/Neoverse V3)" },
-    { "Q4_C_128", LLAMA_FTYPE_MOSTLY_Q4_C_128, " 5.0 bpw, NF4+AWQ, 128B cache lines (Apple M-series)" },
+    { "Q4_C_64",   LLAMA_FTYPE_MOSTLY_Q4_C_64,   " 5.0 bpw, NF4+AWQ, 64B cache lines (x86/Neoverse V3)" },
+    { "Q4_C_128",  LLAMA_FTYPE_MOSTLY_Q4_C_128,  " 5.0 bpw, NF4+AWQ, 128B cache lines (Apple M-series)" },
+    // Q4_KCA: Cache-Line-Aligned K-Quant
+    { "Q4_KCA_64",  LLAMA_FTYPE_MOSTLY_Q4_KCA_64,  " 4.5 bpw, K-quant scales, 64B cache lines (x86/Neoverse)" },
+    { "Q4_KCA_128", LLAMA_FTYPE_MOSTLY_Q4_KCA_128, " 4.5 bpw, K-quant scales, 128B cache lines (Apple M)" },
 };
 
 static const char * const LLM_KV_QUANTIZE_IMATRIX_FILE       = "quantize.imatrix.file";

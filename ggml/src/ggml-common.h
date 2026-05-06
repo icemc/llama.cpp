@@ -304,6 +304,50 @@ typedef struct {
 static_assert(sizeof(block_q4_C_128) == 144, "wrong block_q4_C_128 size");
 
 //
+// Q4_KCA: Cache-Line-Aligned K-Quant
+//
+// Same quantization scheme as Q4_K (K-quant 6-bit sub-scales + FP16 super-scale/min)
+// but restructured so each super-block is exactly 9 cache lines:
+//   line 0:    metadata  (scales, super-scale/min) — prefetched first
+//   lines 1–8: nibbles   — fully streamed with no split-reads
+//
+// This eliminates Q4_K's 144B non-aligned block (144/64 = 2.25 cache lines).
+//
+
+#define QK_KCA_G    256    // weights per K-quant group (same as Q4_K's QK_K=256)
+#define QK_KCA_SB   32     // weights per sub-block (same as Q4_K)
+
+// Q4_KCA_64: x86/Neoverse target (64-byte cache lines)
+// 4 Q4_K groups × 256 weights = 1024 weights/super-block
+// Metadata: 4×(2+2)B super-scale/min + 4×12B sub-scales = 64B (1 cache line)
+// Weights:  512B = 8 cache lines
+#define QK_KCA_64   1024
+typedef struct {
+    ggml_half d[4];        //   8 B — FP16 super-scale per group
+    ggml_half dmin[4];     //   8 B — FP16 super-min  per group
+    uint8_t   scales[48];  //  48 B — 4×12B: 8×(6-bit scale + 6-bit min) per group
+    uint8_t   qs[512];     // 512 B — nibbles (4 groups × 128B)
+} block_q4_KCA_64;         // 576 B = 9×64B, 4.5 bpw
+static_assert(sizeof(block_q4_KCA_64) == 576, "wrong block_q4_KCA_64 size");
+
+// Q4_KCA_128: M1/universal target (128-byte cache lines, also 18×64B)
+// 8 Q4_K groups × 256 weights = 2048 weights/super-block
+// Metadata: 8×(2+2)B + 8×12B = 128B (1 M1 cache line, 2 x86 cache lines)
+// Weights:  1024B = 8 M1 cache lines = 16 x86 cache lines
+#define QK_KCA_128  2048
+typedef struct {
+    ggml_half d[8];        //  16 B — FP16 super-scale per group
+    ggml_half dmin[8];     //  16 B — FP16 super-min  per group
+    uint8_t   scales[96];  //  96 B — 8×12B: 8×(6-bit scale + 6-bit min) per group
+    uint8_t   qs[1024];    // 1024 B — nibbles (8 groups × 128B)
+} block_q4_KCA_128;        // 1152 B = 9×128B = 18×64B, 4.5 bpw
+static_assert(sizeof(block_q4_KCA_128) == 1152, "wrong block_q4_KCA_128 size");
+
+#define N_GROUPS_KCA_64   (QK_KCA_64  / QK_KCA_G)   // = 4
+#define N_GROUPS_KCA_128  (QK_KCA_128 / QK_KCA_G)   // = 8
+#define N_SB_PER_GROUP    (QK_KCA_G   / QK_KCA_SB)  // = 8
+
+//
 // Super-block quantization structures
 //
 

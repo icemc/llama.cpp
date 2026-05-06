@@ -160,6 +160,10 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_C_64       = 41, // 5.0 bpw, NF4+AWQ, 64-byte cache lines
         LLAMA_FTYPE_MOSTLY_Q4_C_128      = 42, // 5.0 bpw, NF4+AWQ, 128-byte cache lines
 
+        // Q4_KCA: Cache-Line-Aligned K-Quant (4.5 bpw)
+        LLAMA_FTYPE_MOSTLY_Q4_KCA_64     = 43, // 4.5 bpw, K-quant scales, 64-byte cache lines (x86/Neoverse)
+        LLAMA_FTYPE_MOSTLY_Q4_KCA_128    = 44, // 4.5 bpw, K-quant scales, 128-byte cache lines (Apple M)
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 

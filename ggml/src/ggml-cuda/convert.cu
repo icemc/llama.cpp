@@ -699,6 +699,88 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
 }
 
 // =============================================================================
+// Q4_KCA: Cache-Line-Aligned K-Quant CUDA dequantization
+// Each CUDA block processes one 256-weight group (identical to a Q4_K block).
+// Grid: (nb × n_groups_per_sb) blocks, 32 threads/block.
+// =============================================================================
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_KCA_64(const void * __restrict__ vx,
+                                                    dst_t * __restrict__ yy) {
+    const block_q4_KCA_64 * x = (const block_q4_KCA_64 *) vx;
+    // blockIdx.x = super-block index * N_GROUPS_KCA_64 + group index
+    const int64_t sb = blockIdx.x / N_GROUPS_KCA_64;
+    const int      g = blockIdx.x % N_GROUPS_KCA_64;
+
+    const int64_t tid = threadIdx.x;  // 0..31
+    const int64_t il  = tid / 8;      // 0..3 — selects 64-weight chunk (2 sub-blocks of 32)
+    const int64_t ir  = tid % 8;      // 0..7 — position within the chunk (4 weights)
+    const int64_t is  = 2 * il;       // sub-block scale index within group
+
+    // Output pointer: weight position = sb*QK_KCA_64 + g*QK_KCA_G + 64*il + 4*ir
+    dst_t * y = yy + sb * (int64_t)QK_KCA_64 + g * QK_KCA_G + 64 * il + 4 * ir;
+
+    const float dall = __half2float(x[sb].d[g]);
+    const float dmin = __half2float(x[sb].dmin[g]);
+    const uint8_t * scales12 = x[sb].scales + g * 12;
+    const uint8_t * q = x[sb].qs + g * 128 + 32 * il + 4 * ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, scales12, sc, m);
+    const float d1 = dall * sc, m1 = dmin * m;
+    get_scale_min_k4(is + 1, scales12, sc, m);
+    const float d2 = dall * sc, m2 = dmin * m;
+
+    for (int l = 0; l < 4; ++l) {
+        y[l +  0] = (dst_t)(d1 * (q[l] & 0xF) - m1);
+        y[l + 32] = (dst_t)(d2 * (q[l] >>  4) - m2);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_KCA_64_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (int)(k / QK_KCA_64);
+    dequantize_block_q4_KCA_64<dst_t><<<nb * N_GROUPS_KCA_64, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_KCA_128(const void * __restrict__ vx,
+                                                     dst_t * __restrict__ yy) {
+    const block_q4_KCA_128 * x = (const block_q4_KCA_128 *) vx;
+    const int64_t sb = blockIdx.x / N_GROUPS_KCA_128;
+    const int      g = blockIdx.x % N_GROUPS_KCA_128;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid / 8;
+    const int64_t ir  = tid % 8;
+    const int64_t is  = 2 * il;
+
+    dst_t * y = yy + sb * (int64_t)QK_KCA_128 + g * QK_KCA_G + 64 * il + 4 * ir;
+
+    const float dall = __half2float(x[sb].d[g]);
+    const float dmin = __half2float(x[sb].dmin[g]);
+    const uint8_t * scales12 = x[sb].scales + g * 12;
+    const uint8_t * q = x[sb].qs + g * 128 + 32 * il + 4 * ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, scales12, sc, m);
+    const float d1 = dall * sc, m1 = dmin * m;
+    get_scale_min_k4(is + 1, scales12, sc, m);
+    const float d2 = dall * sc, m2 = dmin * m;
+
+    for (int l = 0; l < 4; ++l) {
+        y[l +  0] = (dst_t)(d1 * (q[l] & 0xF) - m1);
+        y[l + 32] = (dst_t)(d2 * (q[l] >>  4) - m2);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_KCA_128_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (int)(k / QK_KCA_128);
+    dequantize_block_q4_KCA_128<dst_t><<<nb * N_GROUPS_KCA_128, 32, 0, stream>>>(vx, y);
+}
+
+// =============================================================================
 // C-Quant (Q4_C_64 / Q4_C_128): NF4 + AWQ CUDA dequantization
 // =============================================================================
 
@@ -844,6 +926,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q4_C_64_cuda;
         case GGML_TYPE_Q4_C_128:
             return dequantize_row_q4_C_128_cuda;
+        case GGML_TYPE_Q4_KCA_64:
+            return dequantize_row_q4_KCA_64_cuda;
+        case GGML_TYPE_Q4_KCA_128:
+            return dequantize_row_q4_KCA_128_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -903,6 +989,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q4_C_64_cuda;
         case GGML_TYPE_Q4_C_128:
             return dequantize_row_q4_C_128_cuda;
+        case GGML_TYPE_Q4_KCA_64:
+            return dequantize_row_q4_KCA_64_cuda;
+        case GGML_TYPE_Q4_KCA_128:
+            return dequantize_row_q4_KCA_128_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

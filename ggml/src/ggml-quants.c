@@ -5393,6 +5393,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_Q4_C_64:
         case GGML_TYPE_Q4_C_128:
+        case GGML_TYPE_Q4_KCA_64:
+        case GGML_TYPE_Q4_KCA_128:
             {
                 // scale arrays are FP16 — let the isfinite check happen lazily during dequant
                 GGML_UNUSED(data);
@@ -5758,6 +5760,273 @@ size_t quantize_q4_C_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     char * out = (char *)dst;
     for (int64_t r = 0; r < nrows; ++r) {
         quantize_row_q4_C_128_impl(src + r * n_per_row, (block_q4_C_128 *)out, n_per_row, imatrix);
+        out += row_size;
+    }
+    return nrows * row_size;
+}
+
+// =============================================================================
+// Q4_KCA: Cache-Line-Aligned K-Quant
+// =============================================================================
+// N_GROUPS_KCA_64/128 and N_SB_PER_GROUP are defined in ggml-common.h
+
+// Pack nibbles for one 256-weight group from L[] into 128 bytes of qs[].
+static void kca_pack_nibbles(const uint8_t * L, uint8_t * qs) {
+    for (int j = 0; j < QK_KCA_G; j += 64) {
+        for (int l = 0; l < 32; ++l) qs[l] = L[j + l] | (L[j + l + 32] << 4);
+        qs += 32;
+    }
+}
+
+// Quantize one 256-weight group (ref path, no imatrix).
+static void kca_quantize_group_ref(const float * x, ggml_half * d_out, ggml_half * dmin_out,
+                                    uint8_t * scales_12, uint8_t * qs_128) {
+    uint8_t L[QK_KCA_G];
+    uint8_t Laux[32];
+    float   weights[32];
+    float   gscales[N_SB_PER_GROUP], gmins[N_SB_PER_GROUP];
+    float   max_scale = 0.f, max_min = 0.f;
+
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        float sum_x2 = 0.f;
+        for (int l = 0; l < QK_KCA_SB; ++l) sum_x2 += x[j*QK_KCA_SB+l]*x[j*QK_KCA_SB+l];
+        float av_x = sqrtf(sum_x2 / QK_KCA_SB);
+        for (int l = 0; l < QK_KCA_SB; ++l) weights[l] = av_x + fabsf(x[j*QK_KCA_SB+l]);
+        gscales[j] = make_qkx2_quants(QK_KCA_SB, 15, x + j*QK_KCA_SB, weights,
+                                       L + j*QK_KCA_SB, &gmins[j], Laux, -1.f, 0.1f, 20, false);
+        if (gscales[j] > max_scale) max_scale = gscales[j];
+        if (gmins[j]   > max_min  ) max_min   = gmins[j];
+    }
+
+    float inv_scale = max_scale > 0.f ? 63.f / max_scale : 0.f;
+    float inv_min   = max_min   > 0.f ? 63.f / max_min   : 0.f;
+    memset(scales_12, 0, 12);
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        uint8_t ls = (uint8_t)MIN(63, nearest_int(inv_scale * gscales[j]));
+        uint8_t lm = (uint8_t)MIN(63, nearest_int(inv_min   * gmins[j]));
+        if (j < 4) {
+            scales_12[j]   = ls;
+            scales_12[j+4] = lm;
+        } else {
+            scales_12[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            scales_12[j-4] |= ((ls >> 4) << 6);
+            scales_12[j-0] |= ((lm >> 4) << 6);
+        }
+    }
+
+    *d_out    = GGML_FP32_TO_FP16(max_scale / 63.f);
+    *dmin_out = GGML_FP32_TO_FP16(max_min   / 63.f);
+
+    // Re-quantize with rounded decoded scales for bit-exact consistency.
+    float D    = GGML_FP16_TO_FP32(*d_out);
+    float Dmin = GGML_FP16_TO_FP32(*dmin_out);
+    uint8_t sc, m;
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        get_scale_min_k4(j, scales_12, &sc, &m);
+        float d = D * sc, dm = Dmin * m;
+        if (!d) { memset(L + j*QK_KCA_SB, 0, QK_KCA_SB); continue; }
+        for (int l = 0; l < QK_KCA_SB; ++l) {
+            int v = nearest_int((x[j*QK_KCA_SB+l] + dm) / d);
+            L[j*QK_KCA_SB+l] = (uint8_t)MAX(0, MIN(15, v));
+        }
+    }
+    kca_pack_nibbles(L, qs_128);
+}
+
+// Quantize one 256-weight group with imatrix weights.
+static void kca_quantize_group_impl(const float * x, const float * quant_weights,
+                                     float sigma2, ggml_half * d_out, ggml_half * dmin_out,
+                                     uint8_t * scales_12, uint8_t * qs_128) {
+    uint8_t L[QK_KCA_G], Laux[32];
+    uint8_t Ls[N_SB_PER_GROUP], Lm[N_SB_PER_GROUP];
+    float   weights[32], sw[N_SB_PER_GROUP];
+    float   gscales[N_SB_PER_GROUP], gmins[N_SB_PER_GROUP];
+
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        const float * qw = quant_weights + j * QK_KCA_SB;
+        float sumw = 0.f;
+        for (int l = 0; l < QK_KCA_SB; ++l) {
+            weights[l] = qw[l] * sqrtf(sigma2 + x[j*QK_KCA_SB+l]*x[j*QK_KCA_SB+l]);
+            sumw += weights[l];
+        }
+        sw[j] = sumw;
+        gscales[j] = make_qkx3_quants(QK_KCA_SB, 15, x + j*QK_KCA_SB, weights,
+                                       L + j*QK_KCA_SB, &gmins[j], Laux, -0.9f, 0.05f, 36, false);
+    }
+
+    float d_block = make_qp_quants(N_SB_PER_GROUP, 63, gscales, Ls, sw);
+    float m_block = make_qp_quants(N_SB_PER_GROUP, 63, gmins,   Lm, sw);
+
+    memset(scales_12, 0, 12);
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        uint8_t ls = Ls[j], lm = Lm[j];
+        if (j < 4) {
+            scales_12[j]   = ls;
+            scales_12[j+4] = lm;
+        } else {
+            scales_12[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            scales_12[j-4] |= ((ls >> 4) << 6);
+            scales_12[j-0] |= ((lm >> 4) << 6);
+        }
+    }
+
+    *d_out    = GGML_FP32_TO_FP16(d_block);
+    *dmin_out = GGML_FP32_TO_FP16(m_block);
+
+    float D    = GGML_FP16_TO_FP32(*d_out);
+    float Dmin = GGML_FP16_TO_FP32(*dmin_out);
+    uint8_t sc, m;
+    for (int j = 0; j < N_SB_PER_GROUP; ++j) {
+        get_scale_min_k4(j, scales_12, &sc, &m);
+        float d = D * sc, dm = Dmin * m;
+        if (!d) { memset(L + j*QK_KCA_SB, 0, QK_KCA_SB); continue; }
+        for (int l = 0; l < QK_KCA_SB; ++l) {
+            int v = nearest_int((x[j*QK_KCA_SB+l] + dm) / d);
+            L[j*QK_KCA_SB+l] = (uint8_t)MAX(0, MIN(15, v));
+        }
+    }
+    kca_pack_nibbles(L, qs_128);
+}
+
+// ─── Q4_KCA_64 ───────────────────────────────────────────────────────────────
+
+void quantize_row_q4_KCA_64_ref(const float * GGML_RESTRICT x,
+                                  block_q4_KCA_64 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_KCA_64 == 0);
+    for (int64_t i = 0; i < k / QK_KCA_64; ++i) {
+        for (int g = 0; g < N_GROUPS_KCA_64; ++g)
+            kca_quantize_group_ref(x + i*QK_KCA_64 + g*QK_KCA_G,
+                                    &y[i].d[g], &y[i].dmin[g],
+                                    y[i].scales + g*12, y[i].qs + g*128);
+    }
+}
+
+void dequantize_row_q4_KCA_64(const block_q4_KCA_64 * GGML_RESTRICT x,
+                                float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_KCA_64 == 0);
+    for (int64_t i = 0; i < k / QK_KCA_64; ++i) {
+        float * out = y + i * QK_KCA_64;
+        for (int g = 0; g < N_GROUPS_KCA_64; ++g) {
+            const float D    = GGML_FP16_TO_FP32(x[i].d[g]);
+            const float Dmin = GGML_FP16_TO_FP32(x[i].dmin[g]);
+            const uint8_t * sc12 = x[i].scales + g * 12;
+            const uint8_t * qs   = x[i].qs     + g * 128;
+            float * gout = out + g * QK_KCA_G;
+            int is = 0; uint8_t sc, m;
+            for (int j = 0; j < QK_KCA_G; j += 64) {
+                get_scale_min_k4(is + 0, sc12, &sc, &m);
+                float d1 = D*sc, m1 = Dmin*m;
+                get_scale_min_k4(is + 1, sc12, &sc, &m);
+                float d2 = D*sc, m2 = Dmin*m;
+                for (int l = 0; l < 32; ++l) gout[l]      = d1*(qs[l] & 0xF) - m1;
+                for (int l = 0; l < 32; ++l) gout[l + 32] = d2*(qs[l] >>  4) - m2;
+                gout += 64; qs += 32; is += 2;
+            }
+        }
+    }
+}
+
+static void quantize_row_q4_KCA_64_impl(const float * GGML_RESTRICT x,
+                                          block_q4_KCA_64 * GGML_RESTRICT y,
+                                          int64_t n, const float * imatrix) {
+    assert(n % QK_KCA_64 == 0);
+    for (int64_t i = 0; i < n / QK_KCA_64; ++i) {
+        const float * sb_x  = x + i * QK_KCA_64;
+        const float * sb_im = imatrix ? imatrix + i * QK_KCA_64 : NULL;
+        float sum_x2 = 0.f;
+        for (int l = 0; l < QK_KCA_64; ++l) sum_x2 += sb_x[l]*sb_x[l];
+        float sigma2 = 2.f * sum_x2 / QK_KCA_64;
+        for (int g = 0; g < N_GROUPS_KCA_64; ++g) {
+            if (sb_im)
+                kca_quantize_group_impl(sb_x + g*QK_KCA_G, sb_im + g*QK_KCA_G, sigma2,
+                                        &y[i].d[g], &y[i].dmin[g],
+                                        y[i].scales + g*12, y[i].qs + g*128);
+            else
+                kca_quantize_group_ref(sb_x + g*QK_KCA_G,
+                                       &y[i].d[g], &y[i].dmin[g],
+                                       y[i].scales + g*12, y[i].qs + g*128);
+        }
+    }
+}
+
+size_t quantize_q4_KCA_64(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                            int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_KCA_64, n_per_row);
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_q4_KCA_64_impl(src + r*n_per_row, (block_q4_KCA_64 *)out, n_per_row, imatrix);
+        out += row_size;
+    }
+    return nrows * row_size;
+}
+
+// ─── Q4_KCA_128 ──────────────────────────────────────────────────────────────
+
+void quantize_row_q4_KCA_128_ref(const float * GGML_RESTRICT x,
+                                   block_q4_KCA_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_KCA_128 == 0);
+    for (int64_t i = 0; i < k / QK_KCA_128; ++i) {
+        for (int g = 0; g < N_GROUPS_KCA_128; ++g)
+            kca_quantize_group_ref(x + i*QK_KCA_128 + g*QK_KCA_G,
+                                    &y[i].d[g], &y[i].dmin[g],
+                                    y[i].scales + g*12, y[i].qs + g*128);
+    }
+}
+
+void dequantize_row_q4_KCA_128(const block_q4_KCA_128 * GGML_RESTRICT x,
+                                 float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_KCA_128 == 0);
+    for (int64_t i = 0; i < k / QK_KCA_128; ++i) {
+        float * out = y + i * QK_KCA_128;
+        for (int g = 0; g < N_GROUPS_KCA_128; ++g) {
+            const float D    = GGML_FP16_TO_FP32(x[i].d[g]);
+            const float Dmin = GGML_FP16_TO_FP32(x[i].dmin[g]);
+            const uint8_t * sc12 = x[i].scales + g * 12;
+            const uint8_t * qs   = x[i].qs     + g * 128;
+            float * gout = out + g * QK_KCA_G;
+            int is = 0; uint8_t sc, m;
+            for (int j = 0; j < QK_KCA_G; j += 64) {
+                get_scale_min_k4(is + 0, sc12, &sc, &m);
+                float d1 = D*sc, m1 = Dmin*m;
+                get_scale_min_k4(is + 1, sc12, &sc, &m);
+                float d2 = D*sc, m2 = Dmin*m;
+                for (int l = 0; l < 32; ++l) gout[l]      = d1*(qs[l] & 0xF) - m1;
+                for (int l = 0; l < 32; ++l) gout[l + 32] = d2*(qs[l] >>  4) - m2;
+                gout += 64; qs += 32; is += 2;
+            }
+        }
+    }
+}
+
+static void quantize_row_q4_KCA_128_impl(const float * GGML_RESTRICT x,
+                                           block_q4_KCA_128 * GGML_RESTRICT y,
+                                           int64_t n, const float * imatrix) {
+    assert(n % QK_KCA_128 == 0);
+    for (int64_t i = 0; i < n / QK_KCA_128; ++i) {
+        const float * sb_x  = x + i * QK_KCA_128;
+        const float * sb_im = imatrix ? imatrix + i * QK_KCA_128 : NULL;
+        float sum_x2 = 0.f;
+        for (int l = 0; l < QK_KCA_128; ++l) sum_x2 += sb_x[l]*sb_x[l];
+        float sigma2 = 2.f * sum_x2 / QK_KCA_128;
+        for (int g = 0; g < N_GROUPS_KCA_128; ++g) {
+            if (sb_im)
+                kca_quantize_group_impl(sb_x + g*QK_KCA_G, sb_im + g*QK_KCA_G, sigma2,
+                                        &y[i].d[g], &y[i].dmin[g],
+                                        y[i].scales + g*12, y[i].qs + g*128);
+            else
+                kca_quantize_group_ref(sb_x + g*QK_KCA_G,
+                                       &y[i].d[g], &y[i].dmin[g],
+                                       y[i].scales + g*12, y[i].qs + g*128);
+        }
+    }
+}
+
+size_t quantize_q4_KCA_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                             int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_KCA_128, n_per_row);
+    char * out = (char *)dst;
+    for (int64_t r = 0; r < nrows; ++r) {
+        quantize_row_q4_KCA_128_impl(src + r*n_per_row, (block_q4_KCA_128 *)out, n_per_row, imatrix);
         out += row_size;
     }
     return nrows * row_size;

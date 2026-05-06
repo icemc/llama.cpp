@@ -1365,3 +1365,183 @@ void ggml_vec_dot_q4_C_128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t b
     }
     *s = sumf;
 }
+
+// =============================================================================
+// Q4_KCA vec_dot: cache-line-aligned K-quant dot-product against Q8_K
+// =============================================================================
+
+void quantize_row_q4_KCA_64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_KCA_64_ref(x, (block_q4_KCA_64 *)y, k);
+}
+
+void quantize_row_q4_KCA_128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_KCA_128_ref(x, (block_q4_KCA_128 *)y, k);
+}
+
+// Q4_KCA_64: 1 super-block = 4 groups × 256 weights = 4 Q8_K blocks on the RHS
+void ggml_vec_dot_q4_KCA_64_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                          const void * GGML_RESTRICT vx, size_t bx,
+                                          const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_KCA_64 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q4_KCA_64 * GGML_RESTRICT x = vx;
+    const block_q8_K      * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_KCA_64;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+    const uint8_t * scales_g = (const uint8_t *)&utmp[0];
+    const uint8_t * mins_g   = (const uint8_t *)&utmp[2];
+
+    int8_t  aux8[QK_K];
+    int16_t aux16[8];
+    int32_t aux32[8];
+    float   sums[8];
+
+    memset(sums, 0, 8 * sizeof(float));
+    float sumf = 0.f;
+
+    for (int i = 0; i < nb; ++i) {
+        for (int g = 0; g < N_GROUPS_KCA_64; ++g) {
+            const block_q8_K * yg  = y + i * N_GROUPS_KCA_64 + g;
+            const uint8_t    * q4  = x[i].qs + g * (QK_K / 2);
+            const int8_t     * q8  = yg->qs;
+
+            memcpy(utmp, x[i].scales + g * 12, 12);
+            utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+            const uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+
+            int sumi = 0;
+            for (int j = 0; j < QK_K / 16; ++j) sumi += yg->bsums[j] * (int)mins_g[j / 2];
+
+            int8_t * a = aux8;
+            const uint8_t * q4p = q4;
+            for (int j = 0; j < QK_K / 64; ++j) {
+                for (int l = 0; l < 32; ++l) a[l]      = (int8_t)(q4p[l] & 0xF);
+                a += 32;
+                for (int l = 0; l < 32; ++l) a[l]      = (int8_t)(q4p[l] >> 4);
+                a += 32; q4p += 32;
+            }
+
+            memset(aux32, 0, 8 * sizeof(int32_t));
+            a = aux8;
+            int is = 0;
+            for (int j = 0; j < QK_K / 32; ++j) {
+                int32_t sc = scales_g[is++];
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+            }
+
+            const float D    = GGML_CPU_FP16_TO_FP32(x[i].d[g]);
+            const float Dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin[g]);
+            const float d    = D * yg->d;
+            for (int l = 0; l < 8; ++l) sums[l] += d * aux32[l];
+            sumf -= Dmin * yg->d * sumi;
+        }
+    }
+    for (int l = 0; l < 8; ++l) sumf += sums[l];
+    *s = sumf;
+}
+
+// Q4_KCA_128: 1 super-block = 8 groups × 256 weights = 8 Q8_K blocks on the RHS
+void ggml_vec_dot_q4_KCA_128_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                           const void * GGML_RESTRICT vx, size_t bx,
+                                           const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_KCA_128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q4_KCA_128 * GGML_RESTRICT x = vx;
+    const block_q8_K       * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_KCA_128;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+    const uint8_t * scales_g = (const uint8_t *)&utmp[0];
+    const uint8_t * mins_g   = (const uint8_t *)&utmp[2];
+
+    int8_t  aux8[QK_K];
+    int16_t aux16[8];
+    int32_t aux32[8];
+    float   sums[8];
+
+    memset(sums, 0, 8 * sizeof(float));
+    float sumf = 0.f;
+
+    for (int i = 0; i < nb; ++i) {
+        for (int g = 0; g < N_GROUPS_KCA_128; ++g) {
+            const block_q8_K * yg  = y + i * N_GROUPS_KCA_128 + g;
+            const uint8_t    * q4  = x[i].qs + g * (QK_K / 2);
+            const int8_t     * q8  = yg->qs;
+
+            memcpy(utmp, x[i].scales + g * 12, 12);
+            utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+            const uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+
+            int sumi = 0;
+            for (int j = 0; j < QK_K / 16; ++j) sumi += yg->bsums[j] * (int)mins_g[j / 2];
+
+            int8_t * a = aux8;
+            const uint8_t * q4p = q4;
+            for (int j = 0; j < QK_K / 64; ++j) {
+                for (int l = 0; l < 32; ++l) a[l]      = (int8_t)(q4p[l] & 0xF);
+                a += 32;
+                for (int l = 0; l < 32; ++l) a[l]      = (int8_t)(q4p[l] >> 4);
+                a += 32; q4p += 32;
+            }
+
+            memset(aux32, 0, 8 * sizeof(int32_t));
+            a = aux8;
+            int is = 0;
+            for (int j = 0; j < QK_K / 32; ++j) {
+                int32_t sc = scales_g[is++];
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+                for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+                for (int l = 0; l < 8; ++l) aux32[l] += sc * aux16[l];
+                q8 += 8; a += 8;
+            }
+
+            const float D    = GGML_CPU_FP16_TO_FP32(x[i].d[g]);
+            const float Dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin[g]);
+            const float d    = D * yg->d;
+            for (int l = 0; l < 8; ++l) sums[l] += d * aux32[l];
+            sumf -= Dmin * yg->d * sumi;
+        }
+    }
+    for (int l = 0; l < 8; ++l) sumf += sums[l];
+    *s = sumf;
+}

@@ -351,3 +351,7 @@
 // C-Quant has no arch-specific implementations — always use the generic scalar path.
 #define ggml_vec_dot_q4_C_64_q8_0_generic  ggml_vec_dot_q4_C_64_q8_0
 #define ggml_vec_dot_q4_C_128_q8_0_generic ggml_vec_dot_q4_C_128_q8_0
+
+// Q4_KCA has no arch-specific implementations — always use the generic scalar path.
+#define ggml_vec_dot_q4_KCA_64_q8_K_generic  ggml_vec_dot_q4_KCA_64_q8_K
+#define ggml_vec_dot_q4_KCA_128_q8_K_generic ggml_vec_dot_q4_KCA_128_q8_K
