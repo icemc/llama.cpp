@@ -77,6 +77,17 @@
 #define N_R0_Q4_C_128 2
 #define N_SG_Q4_C_128 2
 
+// Q4_KCA: cache-line-aligned super-blocks of Q4_K groups.
+// Each super-block holds N_GROUPS_KCA_64=4 / N_GROUPS_KCA_128=8 K-quant groups.
+// The mul_mv kernel maps tiisg/8 → group within super-block, so 4-group variants
+// can use the same N_SG=2/N_R0=2 fan-out as Q4_K. The 128-variant has 8 groups
+// so we let one warp cover two super-blocks and keep N_R0=2 for symmetry.
+#define N_R0_Q4_KCA_64  2
+#define N_SG_Q4_KCA_64  2
+
+#define N_R0_Q4_KCA_128 2
+#define N_SG_Q4_KCA_128 2
+
 // function constants offsets
 #define FC_FLASH_ATTN_EXT_PAD          100
 #define FC_FLASH_ATTN_EXT_BLK          200
