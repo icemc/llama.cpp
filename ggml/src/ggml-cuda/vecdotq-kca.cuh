@@ -50,8 +50,12 @@ static __device__ __forceinline__ void kca_get_scale_min(
 //   sp   = pos / 8                — sub-block pair (0..3)
 //   half = (pos % 8) / 4          — 0 = first 16 bytes, 1 = second 16 bytes
 //
-// Dmin correction: only the half=0 thread applies the full Dmin term (via ds.y).
-// The sum of both half=0 and half=1 outputs gives the correct per-sp contribution.
+// Dmin handling: each thread computes its own partial activation sum on-the-fly
+// via dp4a(0x01010101, acts, …) and applies its share of the Dmin correction.
+// After the warp reduction outside this function the partial sums combine into
+// the correct per-sub-block totals. This pattern (taken from Q4_K's mmvq impl)
+// avoids the within-warp branch on `half` and the redundant ds.y memory loads —
+// purely additional dp4a work, which is single-cycle on Ampere/Ada SMs.
 // ──────────────────────────────────────────────────────────────────────────────
 static __device__ __forceinline__ float vec_dot_q4_KCA_64_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
@@ -85,33 +89,31 @@ static __device__ __forceinline__ float vec_dot_q4_KCA_64_q8_1(
     const float d8_0 = __low2float(bq8_1[g * 8 + sb0].ds);
     const float d8_1 = __low2float(bq8_1[g * 8 + sb1].ds);
 
-    int sumi0 = 0, sumi1 = 0;
+    int sumi0 = 0, sumi1 = 0;     // dot products: weights · activations
+    int suma0 = 0, suma1 = 0;     // running sums: 1 · activations  (Dmin term)
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
         const int lo = (v[b]     ) & 0x0F0F0F0F;  // 4 lo nibbles (sb0 weights)
         const int hi = (v[b] >> 4) & 0x0F0F0F0F;  // 4 hi nibbles (sb1 weights)
         sumi0 = ggml_cuda_dp4a(lo, acts0[b], sumi0);
         sumi1 = ggml_cuda_dp4a(hi, acts1[b], sumi1);
+        // dp4a(0x01010101, x, acc) accumulates the four int8 lanes of x.
+        // Per-thread partial activation sum; warp-reduced by the caller.
+        suma0 = ggml_cuda_dp4a(0x01010101, acts0[b], suma0);
+        suma1 = ggml_cuda_dp4a(0x01010101, acts1[b], suma1);
     }
 
-    float result = D * (d8_0 * (float)sc0 * (float)sumi0 + d8_1 * (float)sc1 * (float)sumi1);
-
-    // Apply Dmin correction once per sub-block pair (half=0 thread carries the full ds.y sum).
-    // half=1 contributes only its dp4a partial sum; both halves sum to the correct total.
-    if (half == 0) {
-        const float sumf0 = __high2float(bq8_1[g * 8 + sb0].ds);
-        const float sumf1 = __high2float(bq8_1[g * 8 + sb1].ds);
-        result -= Dmin * ((float)m0 * sumf0 + (float)m1 * sumf1);
-    }
-
-    return result;
+    return D    * (d8_0 * (float)sc0 * (float)sumi0 + d8_1 * (float)sc1 * (float)sumi1)
+         - Dmin * (d8_0 * (float)m0  * (float)suma0 + d8_1 * (float)m1  * (float)suma1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Q4_KCA_128 vec_dot  VDR=4 → qi/vdr=64 threads per block (2 warps/block)
-// Structure identical to Q4_KCA_64 VDR=4 but with g ∈ {0..7} (8 groups).
-// With 64 threads/block: threads 0-31 (warp 0) have half=0 (apply Dmin),
-// threads 32-63 (warp 1) have half=1 (no Dmin) — zero within-warp divergence.
+// Same algorithm as Q4_KCA_64 with g ∈ {0..7} (8 groups). Uses the same
+// branch-free Dmin scheme: every thread accumulates its share of the activation
+// sum on-the-fly; warp reduction stitches the partial sums into the per-sub-
+// block totals. Eliminates the inter-warp work imbalance the half==0 branch
+// previously caused (warp 1 had nothing to do for the Dmin term).
 // ──────────────────────────────────────────────────────────────────────────────
 static __device__ __forceinline__ float vec_dot_q4_KCA_128_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
@@ -144,21 +146,17 @@ static __device__ __forceinline__ float vec_dot_q4_KCA_128_q8_1(
     const float d8_1 = __low2float(bq8_1[g * 8 + sb1].ds);
 
     int sumi0 = 0, sumi1 = 0;
+    int suma0 = 0, suma1 = 0;
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
         const int lo = (v[b]     ) & 0x0F0F0F0F;
         const int hi = (v[b] >> 4) & 0x0F0F0F0F;
         sumi0 = ggml_cuda_dp4a(lo, acts0[b], sumi0);
         sumi1 = ggml_cuda_dp4a(hi, acts1[b], sumi1);
+        suma0 = ggml_cuda_dp4a(0x01010101, acts0[b], suma0);
+        suma1 = ggml_cuda_dp4a(0x01010101, acts1[b], suma1);
     }
 
-    float result = D * (d8_0 * (float)sc0 * (float)sumi0 + d8_1 * (float)sc1 * (float)sumi1);
-
-    if (half == 0) {
-        const float sumf0 = __high2float(bq8_1[g * 8 + sb0].ds);
-        const float sumf1 = __high2float(bq8_1[g * 8 + sb1].ds);
-        result -= Dmin * ((float)m0 * sumf0 + (float)m1 * sumf1);
-    }
-
-    return result;
+    return D    * (d8_0 * (float)sc0 * (float)sumi0 + d8_1 * (float)sc1 * (float)sumi1)
+         - Dmin * (d8_0 * (float)m0  * (float)suma0 + d8_1 * (float)m1  * (float)suma1);
 }
