@@ -68,6 +68,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
+        case GGML_TYPE_Q4_KCA_64:
+            mul_mat_q_case<GGML_TYPE_Q4_KCA_64>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_KCA_128:
+            mul_mat_q_case<GGML_TYPE_Q4_KCA_128>(ctx, args, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -111,7 +117,11 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    // Q4_KCA MMQ iterates at K-quant group granularity (QK_KCA_G=256 weights).
+    // Convert stride from super-blocks/row to groups/row.
+    const int64_t s01 = (src0->type == GGML_TYPE_Q4_KCA_64 || src0->type == GGML_TYPE_Q4_KCA_128)
+        ? ne00 / QK_KCA_G
+        : src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
@@ -238,7 +248,11 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t ne0 = dst->ne[0];
 
     const int64_t row_diff = row_high - row_low;
-    const int64_t stride01 = ne00 / ggml_blck_size(src0->type);
+    // Q4_KCA iterates at K-quant group granularity (QK_KCA_G=256 weights/group).
+    // stride must reflect groups per row, not super-blocks per row.
+    const int64_t stride01 = (src0->type == GGML_TYPE_Q4_KCA_64 || src0->type == GGML_TYPE_Q4_KCA_128)
+        ? ne00 / QK_KCA_G
+        : ne00 / ggml_blck_size(src0->type);
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -294,6 +308,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q4_KCA_64:
+        case GGML_TYPE_Q4_KCA_128:
             mmq_supported = true;
             break;
         default:

@@ -12,31 +12,35 @@
 //
 // K-groups granularity: QK_KCA_SB = 32 weights per Q8_1 block.
 //
-// Design (BLOCK_M=32, BLOCK_N=32, NWARPS=4, RPT=8):
-//   Grid:  (ceil(ne01/32), ceil(ne11/32))
-//   Block: dim3(32, 4) = 128 threads
-//   Each thread: 8 weight rows × 1 token col → 8 accumulators
+// Design (BLOCK_M=64, BLOCK_N=64, NWARPS=4, RPT=16):
+//   Grid:  (ceil(ne01/64), ceil(ne11/64))
+//   Block: dim3(64, 4) = 256 threads (8 warps)
+//   Each thread: 16 weight rows × 1 token col → 16 accumulators
+//
+//   4× larger tiles vs 32×32: doubles weight reuse, doubles activation reuse,
+//   quadruples useful compute per __syncthreads() barrier.
+//   256-thread blocks maximize concurrent blocks/SM (6 blocks vs 3 for 512-thread).
 //
 //   Shared memory per sub-block:
-//     smem_W[32][8]  — nibbles (0x0F0F0F0F masked) per weight row
-//     smem_Ws[32]    — D * sc per weight row  (positive scale)
-//     smem_Wm[32]    — Dmin * m per weight row (min bias)
-//     smem_X[32][9]  — Q8_1 int8 per token col (9 int32s, +1 bank-conflict pad)
-//     smem_Xs[32]    — Q8_1 scale d8 per token col
+//     smem_W[64][8]  — nibbles (0x0F0F0F0F masked) per weight row
+//     smem_Ws[64]    — D * sc per weight row  (positive scale)
+//     smem_Wm[64]    — Dmin * m per weight row (min bias)
+//     smem_X[64][9]  — Q8_1 int8 per token col (9 int32s, +1 bank-conflict pad)
+//     smem_Xs[64]    — Q8_1 scale d8 per token col
 
 #include "common.cuh"
 #include "quantize.cuh"
 #include "mmq-q4c.cuh"    // for quantize_q8_1_group_major
 #include "vecdotq-kca.cuh"
 
-static constexpr int MMQ_KCA_BLOCK_M = 32;
-static constexpr int MMQ_KCA_BLOCK_N = 32;
+static constexpr int MMQ_KCA_BLOCK_M = 64;
+static constexpr int MMQ_KCA_BLOCK_N = 64;
 static constexpr int MMQ_KCA_NWARPS  = 4;
-static constexpr int MMQ_KCA_RPT     = MMQ_KCA_BLOCK_M / MMQ_KCA_NWARPS; // 8 rows/thread
+static constexpr int MMQ_KCA_RPT     = MMQ_KCA_BLOCK_M / MMQ_KCA_NWARPS; // 16 rows/thread
 
 // ── GEMM kernel ───────────────────────────────────────────────────────────────
 template <ggml_type type>
-static __global__ void __launch_bounds__(MMQ_KCA_BLOCK_N * MMQ_KCA_NWARPS, 2)
+static __global__ void __launch_bounds__(MMQ_KCA_BLOCK_N * MMQ_KCA_NWARPS, 1)
 mul_mat_q4_KCA_f32_kernel(
         const char  * __restrict__ src0_d,     // quantized weight data
         const char  * __restrict__ src1_q8_d,  // Q8_1 activations, group-major layout
@@ -62,15 +66,17 @@ mul_mat_q4_KCA_f32_kernel(
 
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;   // token col within tile
-    const int tid     = warp_id * WARP_SIZE + lane_id;
+    // Linear thread id: unique over [0, BLOCK_N*NWARPS), used for smem loads.
+    // Must use BLOCK_N (not WARP_SIZE) as stride since blockDim.x == BLOCK_N.
+    const int tid     = warp_id * MMQ_KCA_BLOCK_N + lane_id;
 
     const int tile_row = blockIdx.x * MMQ_KCA_BLOCK_M;
     const int tile_col = blockIdx.y * MMQ_KCA_BLOCK_N;
 
-    __shared__ int32_t smem_W[MMQ_KCA_BLOCK_M][8];   // nibbles per weight row
+    __shared__ int32_t smem_W[MMQ_KCA_BLOCK_M][8];   // nibbles per weight row (64×8)
     __shared__ float   smem_Ws[MMQ_KCA_BLOCK_M];     // D * sc  (scale)
     __shared__ float   smem_Wm[MMQ_KCA_BLOCK_M];     // Dmin * m (bias)
-    __shared__ int32_t smem_X[MMQ_KCA_BLOCK_N][9];   // Q8_1 activations (+1 pad)
+    __shared__ int32_t smem_X[MMQ_KCA_BLOCK_N][9];   // Q8_1 activations (+1 pad, 64×9)
     __shared__ float   smem_Xs[MMQ_KCA_BLOCK_N];     // Q8_1 scale d8
 
     float acc[MMQ_KCA_RPT] = {};
@@ -85,8 +91,8 @@ mul_mat_q4_KCA_f32_kernel(
         const int hi  = sb & 1;                      // lo(0) or hi(1) nibbles
 
         // ── Load weight nibbles and scales ────────────────────────────────────
-        // 128 threads cover 32 rows × 8 int32s = 256 operations in two passes
-        for (int ld = tid; ld < MMQ_KCA_BLOCK_M * 8; ld += MMQ_KCA_BLOCK_M * MMQ_KCA_NWARPS) {
+        // 512 threads cover 128 rows × 8 int32s = 1024 elements in two passes
+        for (int ld = tid; ld < MMQ_KCA_BLOCK_M * 8; ld += MMQ_KCA_BLOCK_N * MMQ_KCA_NWARPS) {
             const int ld_row = ld >> 3;       // ld / 8
             const int ld_b   = ld & 7;        // ld % 8
             const int abs_row = tile_row + ld_row;
@@ -130,8 +136,8 @@ mul_mat_q4_KCA_f32_kernel(
         }
 
         // ── Load Q8_1 activations (group-major layout → coalesced) ───────────
-        // 128 threads cover 32 cols × 8 int32s = 256 operations in two passes
-        for (int ld = tid; ld < MMQ_KCA_BLOCK_N * 8; ld += MMQ_KCA_BLOCK_M * MMQ_KCA_NWARPS) {
+        // 512 threads cover 64 cols × 8 int32s = 512 elements in one pass
+        for (int ld = tid; ld < MMQ_KCA_BLOCK_N * 8; ld += MMQ_KCA_BLOCK_N * MMQ_KCA_NWARPS) {
             const int ld_col = ld >> 3;
             const int ld_k   = ld & 7;
             const int abs_col = tile_col + ld_col;
