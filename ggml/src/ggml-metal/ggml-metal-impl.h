@@ -79,9 +79,11 @@
 
 // Q4_KCA: cache-line-aligned super-blocks of Q4_K groups.
 // Each super-block holds N_GROUPS_KCA_64=4 / N_GROUPS_KCA_128=8 K-quant groups.
-// The mul_mv kernel maps tiisg/8 → group within super-block, so 4-group variants
-// can use the same N_SG=2/N_R0=2 fan-out as Q4_K. The 128-variant has 8 groups
-// so we let one warp cover two super-blocks and keep N_R0=2 for symmetry.
+//
+// Apple Silicon tuning: we tried N_R0=4 (more rows per simdgroup), but at the
+// 1B and 3B scales the M1 kernel is already memory-bandwidth-pinned and the
+// extra rows just buy register pressure. N_R0=2 / N_SG=2 matches Q4_K which
+// is the algorithmic peer.
 #define N_R0_Q4_KCA_64  2
 #define N_SG_Q4_KCA_64  2
 

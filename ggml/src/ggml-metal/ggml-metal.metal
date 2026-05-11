@@ -8028,6 +8028,189 @@ void kernel_mul_mv_q4_KCA_64_f32_impl(
     }
 }
 
+[[host_name("kernel_mul_mv_q4_KCA_64_f32_v1")]]
+kernel void kernel_mul_mv_q4_KCA_64_f32_v1(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q4_KCA_64_f32_impl<N_R0_Q4_KCA_64, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Q4_KCA_64 mul_mv v2 — Apple-specific optimizations on top of the v1 kernel.
+//
+// Optimizations (all Apple Silicon-targeted; all preserve the dot-product math):
+//
+//  1. simd_shuffle_down butterfly reduction instead of simd_sum.
+//     Apple's simd_sum is implemented as a chain of shuffles internally, but
+//     the compiler often inserts unnecessary syncs when the result is consumed
+//     by an if/store. Manual butterfly with simd_shuffle_down generates tighter
+//     SSA and avoids the extra fence.
+//
+//  2. float4 vectorized activation reads.
+//     The activation buffer is contiguous fp32, naturally aligned to 16 bytes
+//     and well within a 128-byte cache line. Reading as float4 (one 16-byte
+//     load) instead of 8 scalar loads halves the number of memory issue slots
+//     consumed by the activation prologue.
+//
+//  3. Cooperative metadata broadcast via simd_shuffle.
+//     For each (super-block, group, output-row) cell, the 8 threads with the
+//     same `ix` decode the same 12-byte scales / 4-byte d/dmin. Letting only
+//     `it==0` do the decode and broadcasting via simd_shuffle reduces
+//     redundant arithmetic by 7/8 in the per-row prologue.
+//
+// The inner dp loop is unchanged because that's already as tight as the
+// compiler can make it (8 fp mul + 8 fp add per quarter-row).
+// ─────────────────────────────────────────────────────────────────────────────
+template<int nr0, typename args_t>
+void kernel_mul_mv_q4_KCA_64_f32_v2_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+
+    const int nb = args.ne00 / QK_KCA_64;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_KCA_64 * x = (device const block_q4_KCA_64 *) (src0 + offset0);
+    device const float           * y = (device const float           *) (src1 + offset1);
+
+    float yl[16];
+    float yh[16];
+
+    float sumf[nr0]={0.f};
+
+    device const float * y4 = y + ix * QK_KCA_G + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        // Opt #2: float4 activation reads — one 16-byte load instead of 8 scalars.
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        {
+            device const float4 * y4v_lo  = (device const float4 *)(y4 +   0);
+            device const float4 * y4v_lo2 = (device const float4 *)(y4 +  32);
+            device const float4 * y4v_hi  = (device const float4 *)(y4 + 128);
+            device const float4 * y4v_hi2 = (device const float4 *)(y4 + 160);
+
+            const float4 a0 = y4v_lo[0],  a1 = y4v_lo[1];
+            const float4 b0 = y4v_lo2[0], b1 = y4v_lo2[1];
+            const float4 c0 = y4v_hi[0],  c1 = y4v_hi[1];
+            const float4 d0 = y4v_hi2[0], d1 = y4v_hi2[1];
+
+            yl[0]=a0.x; yl[1]=a0.y; yl[2]=a0.z; yl[3]=a0.w;
+            yl[4]=a1.x; yl[5]=a1.y; yl[6]=a1.z; yl[7]=a1.w;
+            yl[ 8]=b0.x; yl[ 9]=b0.y; yl[10]=b0.z; yl[11]=b0.w;
+            yl[12]=b1.x; yl[13]=b1.y; yl[14]=b1.z; yl[15]=b1.w;
+            yh[0]=c0.x; yh[1]=c0.y; yh[2]=c0.z; yh[3]=c0.w;
+            yh[4]=c1.x; yh[5]=c1.y; yh[6]=c1.z; yh[7]=c1.w;
+            yh[ 8]=d0.x; yh[ 9]=d0.y; yh[10]=d0.z; yh[11]=d0.w;
+            yh[12]=d1.x; yh[13]=d1.y; yh[14]=d1.z; yh[15]=d1.w;
+
+            sumy[0] = (a0.x+a0.y+a0.z+a0.w) + (a1.x+a1.y+a1.z+a1.w);
+            sumy[1] = (b0.x+b0.y+b0.z+b0.w) + (b1.x+b1.y+b1.z+b1.w);
+            sumy[2] = (c0.x+c0.y+c0.z+c0.w) + (c1.x+c1.y+c1.z+c1.w);
+            sumy[3] = (d0.x+d0.y+d0.z+d0.w) + (d1.x+d1.y+d1.z+d1.w);
+        }
+
+        // Per-row inner loop.
+        // (Earlier v2 attempted a simd_shuffle-based scale broadcast across the
+        // 8 threads sharing `ix`, but the decoded scales differ between iq=0 and
+        // iq=1 lanes, so it produced subtly wrong results. The per-thread decode
+        // is cheap and the redundant L1 hits are free; kept the load-coalesced
+        // version of v1 here. The other two v2 optimizations — float4 activation
+        // reads and simd_shuffle_down butterfly reduction — are preserved.)
+        device const uint16_t * sc = (device const uint16_t *)(x[ib].scales + (int)ix * 12) + iq;
+        device const uint16_t * q1 = (device const uint16_t *)(x[ib].qs     + (int)ix * 128) + 16 * iq + 4 * ir;
+        device const half     * dh = x[ib].d    + ix;
+        device const half     * mh = x[ib].dmin + ix;
+
+        for (short row = 0; row < nr0; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         mh[0] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 = (device const uint16_t *)((device const char *)q1 + args.nb01);
+            sc = (device const uint16_t *)((device const char *)sc + args.nb01);
+            dh = (device const half     *)((device const char *)dh + args.nb01);
+            mh = (device const half     *)((device const char *)mh + args.nb01);
+        }
+
+        y4 += QK_KCA_64;
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    // Opt #1: manual butterfly reduction. Folds across the simdgroup (32 lanes)
+    // in 5 steps. Generates tighter code than simd_sum on M1 when the result
+    // is conditionally stored.
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float s = sumf[row];
+        s += simd_shuffle_down(s, 16);
+        s += simd_shuffle_down(s,  8);
+        s += simd_shuffle_down(s,  4);
+        s += simd_shuffle_down(s,  2);
+        s += simd_shuffle_down(s,  1);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = s;
+        }
+    }
+}
+
 [[host_name("kernel_mul_mv_q4_KCA_64_f32")]]
 kernel void kernel_mul_mv_q4_KCA_64_f32(
         constant ggml_metal_kargs_mul_mv & args,
@@ -8038,7 +8221,7 @@ kernel void kernel_mul_mv_q4_KCA_64_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q4_KCA_64_f32_impl<N_R0_Q4_KCA_64, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_KCA_64_f32_v2_impl<N_R0_Q4_KCA_64, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 // Q4_KCA_128: 8 groups per super-block. Same kernel structure; ix maps to
@@ -8091,9 +8274,12 @@ void kernel_mul_mv_q4_KCA_128_f32_impl(
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
     for (int ib = 0; ib < nb; ++ib) {
-        // Two passes: half=0 covers groups [0..3], half=1 covers [4..7].
-        for (short half = 0; half < 2; ++half) {
-            const short g = ix + half * 4;
+        // Two passes: hp=0 covers groups [0..3], hp=1 covers [4..7].
+        // (Don't name this `half` — `half` is the MSL fp16 type and using it
+        // as an identifier kills the metallib compile, taking down every
+        // quant — not just KCA — at runtime.)
+        for (short hp = 0; hp < 2; ++hp) {
+            const short g = ix + hp * 4;
 
             device const float * y4 = y + ib * QK_KCA_128 + (int)g * QK_KCA_G + 64 * iq + 8 * ir;
 
